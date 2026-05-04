@@ -146,7 +146,7 @@ def split_zero_shot(adata, cfg, logger, seed=None):
         zs.get("stratify_bins", 4),
         rng)
 
-    val_ratio = zs.get("validation_ratio", 0.15)
+    val_ratio = zs.get("validation_ratio", 0.20)
     n_val     = max(1, int(len(train_labels) * val_ratio))
     rng.shuffle(train_labels)
     val_labels   = train_labels[:n_val]
@@ -177,6 +177,14 @@ def split_zero_shot(adata, cfg, logger, seed=None):
     snapshot(train_ad, "Train split", logger)
     snapshot(val_ad,   "Val split",   logger)
     snapshot(test_ad,  "Test split",  logger)
+
+    # Sanity check: val should be larger than test (controls in val, not test)
+    if val_ad.n_obs < test_ad.n_obs:
+        logger.warning(
+            f"  ⚠ val ({val_ad.n_obs:,}) < test ({test_ad.n_obs:,}). "
+            f"Increase validation_ratio (currently "
+            f"{zs.get('validation_ratio', 0.20)}) or the test perturbations "
+            f"have more cells than val. Downstream tools expect val ≥ test.")
 
     return {
         "train": train_ad, "val": val_ad, "test": test_ad,
