@@ -1,0 +1,325 @@
+# ============================================================================
+#  SPORE+  —  Systematic Preprocessing and Optimization for Robust Evaluation
+#  Unified Configuration  ·  Milestone 1
+#  Merges SPORE (Phases 0-12) + CHITIN (Phase 13) into a single pipeline
+# ============================================================================
+
+# ── Paths ───────────────────────────────────────────────────────────────────
+paths:
+  project_root:  ""                # absolute path to your project directory
+  raw_h5ad:      ""                # path to your raw .h5ad file
+  processed_dir: "output"
+  splits_dir:    "output/splits"
+  figures_dir:   "figures"
+  log_dir:       "logs"
+  chitin_output_dir: "output/chitin"
+
+# ── Dataset Metadata ────────────────────────────────────────────────────────
+# These are filled in manually OR auto-populated by label_detection.py
+# Run:  python label_detection.py /path/to/your/file.h5ad
+dataset:
+  name:              ""            # dataset name (used in output filenames)
+  organism:          "human"       # human | mouse
+  cell_line:         ""            # primary cell line (if single cell line)
+  perturbation_type: "CRISPRi"     # CRISPRi | CRISPRa | CRISPRko | mixed
+  perturbation_col:  "gene"        # .obs column holding perturbation labels
+  control_label:     "non-targeting"
+  batch_col:         "gem_group"   # .obs column for batch (null if none)
+
+  # Combinatorial perturbation settings (auto-detected by Phase 1)
+  perturbation_structure: "single"  # single | combinatorial (auto-detected)
+  perturbation_separator: "+"       # separator in compound labels (e.g. "GENE_A+GENE_B")
+
+  # Gene ID format (auto-detected by Phase 1)
+  gene_id_format: "auto"   # auto | symbol | ensembl | entrez
+  # If auto-detection maps Ensembl→HGNC, the mapping file can be provided
+  # or mygene.py will be used. Leave null to use online lookup.
+  gene_id_mapping_file: null
+
+# ── Runtime ─────────────────────────────────────────────────────────────────
+runtime:
+  n_jobs:              8
+  sparse_on_load:      true
+  memory_monitor:      true
+  large_dataset_mode:  "auto"    # auto | true | false
+  large_dataset_threshold: 5000000  # cells above this trigger backed-mode HVG
+  checkpointing:       false     # save phase-by-phase checkpoints (HPC use)
+
+# ── Phase 0 · Data Ingestion & Sparsification ────────────────────────────────
+phase0_ingestion:
+  chunk_size: 50000
+
+# ── Phase 1 · Detection ──────────────────────────────────────────────────────
+# Detects: modality, gene ID format, combinatorial perturbations, cell line columns
+phase1_detection:
+  enabled: true
+
+  # Modality detection
+  modality_detection: true
+  # If modality is snRNA-seq, the MT% filter is automatically disabled
+  # and min_genes thresholds are adjusted
+
+  # Gene ID harmonization: auto-detect and translate Ensembl → HGNC
+  gene_id_harmonization: true
+  # Organism-specific Ensembl prefix patterns
+  ensembl_prefixes:
+    human:  "ENSG"
+    mouse:  "ENSMUSG"
+    zebrafish: "ENSDARG"
+
+  # Combinatorial perturbation auto-detection
+  # Checks for separator characters in top perturbation label values
+  combinatorial_detection: true
+  combinatorial_separators: ["+", ",", "|", ";"]
+  # Min fraction of perturbation labels that must contain a separator
+  # to flag as combinatorial (prevents false positives on e.g. "non-targeting")
+  combinatorial_min_fraction: 0.05
+
+  # Cell line column detection (for Tier 1: label already exists in .obs)
+  cell_line_detection: true
+  # Categorical column heuristics for cell line columns (no vocab needed)
+  cell_line_col_min_unique: 2
+  cell_line_col_max_unique: 20
+  cell_line_col_max_label_length: 40
+
+# ── Phase 2 · Cell-Level Triage ─────────────────────────────────────────────
+phase2_cell_triage:
+  # For snRNA-seq: mt_threshold is auto-set to null (MT genes absent)
+  mt_method: "explicit_list"   # explicit_list | prefix
+  mt_threshold: 0.20
+  mt_genes:
+    - MT-ND1
+    - MT-ND2
+    - MT-ND3
+    - MT-ND4
+    - MT-ND4L
+    - MT-ND5
+    - MT-ND6
+    - MT-CO1
+    - MT-CO2
+    - MT-CO3
+    - MT-ATP6
+    - MT-ATP8
+    - MT-CYB
+  ribo_prefixes: ["RPL", "RPS"]
+  min_genes_per_cell:   200
+  max_genes_per_cell:   10000
+  min_counts_per_cell:  500
+  max_counts_per_cell:  80000
+
+# ── Phase 3 · Ambient RNA Decontamination ────────────────────────────────────
+# MILESTONE 1: Placeholder — disabled until Milestone 2
+phase3_ambient:
+  enabled: true
+  method: "soupx"   # soupx | cellbender (Milestone 2)
+
+# ── Phase 4 · Doublet Detection ──────────────────────────────────────────────
+# MILESTONE 1: Placeholder — disabled until Milestone 2
+phase4_doublets:
+  enabled: true
+  method: "scDblFinder"
+  expected_doublet_rate: null  # null = auto (0.008 per 1000 cells)
+  score_column: "doublet_score"
+  remove_doublets: true
+
+# ── Phase 5 · Escaper Filtering ─────────────────────────────────────────────
+phase5_escaper_filtering:
+  # Milestone 2: efficiency scoring threshold
+  efficiency_threshold: 0.50   # perturbations with < 50% cells kept are flagged
+  escaper_percentile: 10
+  min_cells_per_perturbation: 50
+  # CRISPRa direction: for knockdown (CRISPRi/ko) keep cells BELOW percentile.
+  # For activation (CRISPRa) keep cells ABOVE (100-percentile).
+  # "auto" reads dataset.perturbation_type from config.
+  direction: "auto"   # auto | knockdown | activation
+
+# ── Phase 6 · Gene-Level Triage ─────────────────────────────────────────────
+phase6_gene_triage:
+  min_cells_expressing:      10
+  small_dataset_threshold:   50000
+  pct_filter:                0.05
+  mean_umi_threshold:        0.25
+  rescue_perturbation_targets: true
+  # For combinatorial datasets, rescue all constituent genes from compound labels
+  rescue_combinatorial_constituents: true
+
+# ── Phase 7 · Data Splits ────────────────────────────────────────────────────
+phase7_splits:
+  mode: "zero_shot"   # zero_shot | cell_wise
+  random_seed: 42
+  test_mode: false
+  test_mode_seeds: [42, 123, 256, 789, 1024]
+
+  zero_shot:
+    train_test_ratio:   0.90
+    validation_ratio:   0.20
+    stratify_by:        "mean_shift"   # mean_shift | deg_count
+    stratify_bins:      4
+    deg_threshold:      0.05
+
+  cell_wise:
+    train_ratio:   0.80
+    val_ratio:     0.10
+    test_ratio:    0.10
+
+  # Multi-cell-line: whether split assignments are made globally across all
+  # cell lines (recommended) or independently per cell line.
+  # "global" = same perturbation labels in same splits across all cell lines.
+  multi_cell_line_split_mode: "global"
+
+# ── Phase 8 · Dimensionality Reduction (HVG) ────────────────────────────────
+phase8_hvg:
+  enabled:   true
+  n_top_genes: 5000
+  method:    "seurat_v3"
+  rescue_perturbation_targets: true
+
+# ── Phase 9 · Normalization ──────────────────────────────────────────────────
+phase9_normalization:
+  target_sum:    null      # null = median total counts
+  log_transform: true
+  method:        "lognorm" # lognorm | sctransform (sctransform = Milestone 3)
+
+# ── Phase 10 · Confounder Mitigation ─────────────────────────────────────────
+phase10_confounders:
+  cell_cycle_regression: true
+  s_genes:   "tirosh2016"
+  g2m_genes: "tirosh2016"
+
+  batch_correction:
+    enabled: true
+    method:  "harmony"     # harmony | scvi (scvi = Milestone 3)
+    batch_key: "gem_group"
+    # Confounding check: if batch and perturbation labels are too correlated,
+    # Harmony correction is warned against.
+    confounding_ari_threshold: 0.5
+    min_cells_per_batch: 50
+
+  imputation_prohibited: true
+  fit_on_train_only: true
+
+# ── Phase 11 · Cell Line Detection & Separation ──────────────────────────────
+phase11_cell_line:
+  enabled: "auto"   # true | false | auto (auto = enable if >1 cell line detected)
+
+  # Tier 1: does .obs contain an existing cell line label column?
+  # (populated by Phase 1 detection if found; null = not found)
+  cell_line_col: null
+
+  # Tier 2: hint-guided k-means
+  # If known, set expected_n_cell_lines to guide detection.
+  # null = no hint, fall through to Tier 3.
+  expected_n_cell_lines: null
+
+  # Tier 3: fully automatic detection
+  # Runs HDBSCAN + GMM BIC sweep + bootstrap stability validation
+  auto_detect:
+    enabled: true
+    max_k_to_try: 15
+    # Bootstrap resampling for stability
+    n_bootstrap:   50
+    bootstrap_frac: 0.80
+    min_stability_ari: 0.85
+    # GMM BIC: stop searching if BIC improvement < min_bic_improvement
+    min_bic_improvement: 50.0
+
+  # V-direction validation: check if detected sub-populations have divergent
+  # regulatory contexts (separate) or parallel (same regulatory program, don't split)
+  v_direction_validation: true
+  v_direction_angle_threshold: 0.5  # cosine similarity threshold for "divergent"
+
+  # Minimum cells per cell line to retain it as a separate output
+  min_cells_per_cell_line: 500
+
+  # For single-cell output mode (no metacells): output per-cell-line splits
+  # at the end of Phase 11 instead of at Phase 12
+  output_single_cell_splits: false
+
+# ── Phase 12 · Metacell Aggregation ──────────────────────────────────────────
+phase12_metacell:
+  enabled: true
+  target_cells_per_metacell: 10
+  # Dynamic graining: if set, target this many metacells per perturbation group
+  # overrides target_cells_per_metacell when set. null = use fixed target.
+  target_metacells_per_group: null
+  min_cells_per_metacell: 3
+
+  systema_calibration: true
+
+  # Quality metrics: compute inner variance per perturbation group
+  compute_quality_metrics: true
+  # Flag groups where inner variance exceeds this threshold
+  inner_variance_warn_threshold: 2.0
+
+  # Output naming: {dataset}_{cell_line}_{split}_metacell.h5ad
+  # For single-cell-line datasets: {dataset}_{split}_metacell.h5ad
+  suffix: "_metacell"
+
+# ── Phase 13 · CHITIN Correction ─────────────────────────────────────────────
+phase13_chitin:
+  enabled: true
+
+  # CHITIN correction mode (see CHITIN README)
+  # knn: best for heterogeneous cell lines (K562, RPE1, cancer lines)
+  # pc_decomposition: best for homogeneous lines (iPSC, hESC)
+  # hybrid: most aggressive (PC decomp then KNN on residuals)
+  correction_mode: "knn"   # knn | pc_decomposition | hybrid
+
+  # KNN parameters (used when auto_calibrate: false, or as fallback)
+  knn:
+    n_pcs:           50
+    k:               20
+    distance_metric: "euclidean"
+    svd_solver:      "randomized"
+
+  # Auto-calibration: Pareto sweep over (k, n_pcs, distance_metric)
+  calibration:
+    auto_calibrate: true
+    k_grid:         [1, 3, 5, 10, 15, 20, 30, 50]
+    n_pcs_grid:     [5, 10, 15, 20, 30, 50]
+    metric_grid:    ["euclidean", "cosine"]
+    min_stability_fraction: 0.50
+
+  # PC decomposition threshold for systematic PC detection
+  pc_systematic_threshold: 0.30
+
+  # Diagnostics
+  diagnostics:
+    k_sweep: true
+    k_sweep_range: [5, 10, 15, 20, 30, 50, 75, 100]
+    compute_systema_cosines: true
+    pc_decomposition_report: true
+    pc_top_genes: 10
+
+  output:
+    suffix: "_chitin"
+    preserve_systema_centroids: true
+    save_sweep_results: true
+
+# ── Plotting ─────────────────────────────────────────────────────────────────
+plotting:
+  style:          "dark"    # dark | light
+  dpi:            200
+  save_figures:   true
+  figure_format:  "png"
+
+# ── Output ───────────────────────────────────────────────────────────────────
+output:
+  # Post-run cleanup: remove intermediate p9/p10 files and Phase 12 shards
+  # Set true to keep your output directory clean after a successful full run
+  cleanup_intermediates: false
+
+  # Output graph type: what to hand off to FUNGI
+  # "metacell_chitin" = full pipeline (metacells + CHITIN correction)
+  # "metacell"        = metacells only (skip CHITIN)
+  # "singlecell"      = skip metacell aggregation entirely
+  graph_type:  "metacell_chitin"
+
+  # Generate comprehensive end-of-run summary report
+  generate_report: true
+  report_format:   "md"   # md | txt
+
+# ── Downstream ───────────────────────────────────────────────────────────────
+downstream:
+  grn:            "PSGRN"
+  output_format:  "h5ad"
