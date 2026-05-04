@@ -99,9 +99,9 @@ def run_phase3(adata, cfg: dict, logger) -> "AnnData":
             adata = _ambient_from_raw_matrix(adata, raw_path, threshold,
                                               min_umi_pct, log)
 
-    if mode == "control_profile":
-        adata = _ambient_from_control_profile(
-            adata, pert_col, ctrl_label, threshold, min_umi_pct, log)
+    if mode in ["control_profile", "global_profile"]:
+        adata = _ambient_from_global_profile(
+            adata, threshold, min_umi_pct, log)
 
     n_flagged = int(adata.obs.get("ambient_flagged", False).sum())
     log.info(f"  Ambient flagged: {n_flagged:,} / {n_start:,} cells "
@@ -119,34 +119,22 @@ def run_phase3(adata, cfg: dict, logger) -> "AnnData":
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Strategy A: control-profile ambient scoring
+#  Strategy A: Global-profile ambient scoring (Replaces control_profile)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _ambient_from_control_profile(adata, pert_col: str, ctrl_label: str,
-                                   threshold: float, min_umi_pct: float,
-                                   logger) -> "AnnData":
+def _ambient_from_global_profile(adata, threshold: float, min_umi_pct: float, logger) -> "AnnData":
     """
-    Estimate ambient signature from non-targeting controls.
-    Score each cell by cosine similarity to the ambient signature.
+    Estimate ambient signature from the global dataset average.
+    Score each cell by cosine similarity to the global ambient signature.
     Flag cells above threshold that also have low total UMI.
     """
-    labels     = adata.obs[pert_col].values
-    ctrl_mask  = np.array([str(l) == ctrl_label for l in labels])
-    n_ctrl     = ctrl_mask.sum()
-
-    if n_ctrl == 0:
-        logger.warning("  Phase 3: no control cells found — ambient scoring skipped")
-        adata.obs["ambient_score"]   = 0.0
-        adata.obs["ambient_flagged"] = False
-        return adata
-
-    logger.info(f"  Computing ambient signature from {n_ctrl:,} control cells...")
+    logger.info(f"  Computing ambient signature from global dataset average ({adata.n_obs:,} cells)...")
 
     X = adata.X
     if sp.issparse(X):
-        ambient_profile = np.asarray(X[ctrl_mask].mean(axis=0)).ravel()
+        ambient_profile = np.asarray(X.mean(axis=0)).ravel()
     else:
-        ambient_profile = X[ctrl_mask].mean(axis=0).ravel()
+        ambient_profile = X.mean(axis=0).ravel()
 
     ambient_profile = ambient_profile.astype(np.float32)
     amb_norm = np.linalg.norm(ambient_profile)
@@ -158,7 +146,7 @@ def _ambient_from_control_profile(adata, pert_col: str, ctrl_label: str,
 
     amb_unit = ambient_profile / amb_norm
 
-    # Score in batches to avoid loading full dense matrix
+    # Score in batches to avoid memory blowouts on massive datasets
     batch_size = 50_000
     n_cells    = adata.n_obs
     scores     = np.zeros(n_cells, dtype=np.float32)
@@ -182,7 +170,6 @@ def _ambient_from_control_profile(adata, pert_col: str, ctrl_label: str,
         umi_thresh   = float(np.percentile(umi_vals, min_umi_pct * 100))
         low_umi_mask = umi_vals <= umi_thresh
     else:
-        # Fall back: flag by score alone
         low_umi_mask = np.ones(n_cells, dtype=bool)
 
     adata.obs["ambient_flagged"] = (
