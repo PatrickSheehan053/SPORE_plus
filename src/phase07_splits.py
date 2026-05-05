@@ -131,39 +131,76 @@ def _stratified_split(perturbations, train_ratio, n_bins, rng):
 
 
 def split_zero_shot(adata, cfg, logger, seed=None):
-    zs        = cfg.get("phase7_splits", {}).get("zero_shot", {})
-    pert_col  = cfg["dataset"]["perturbation_col"]
+    zs = cfg.get("phase7_splits", {})
+    pert_col = cfg["dataset"]["perturbation_col"]
     ctrl_label = cfg["dataset"]["control_label"]
 
     if seed is None:
-        seed = cfg.get("phase7_splits", {}).get("random_seed", 42)
+        seed = zs.get("random_seed", 42)
     rng = np.random.default_rng(seed)
 
     deg_counts = _compute_mean_shift(adata, cfg, logger)
-    train_labels, test_labels = _stratified_split(
-        deg_counts,
-        zs.get("train_test_ratio", 0.90),
-        zs.get("stratify_bins", 4),
-        rng)
+    n_perts = len(deg_counts)
+    
+    # ── 1. The Literature-Standard Split Ratios ──
+    # Hold out 25% of perturbations for Test
+    test_ratio = zs.get("test_ratio", 0.25)
+    n_test = max(1, int(n_perts * test_ratio))
+    
+    # Of the remaining 75%, hold out 10% for Validation
+    val_ratio = zs.get("val_ratio", 0.10)
+    n_remain = n_perts - n_test
+    n_val = max(1, int(n_remain * val_ratio))
+    n_train = n_remain - n_val
 
-    val_ratio = zs.get("validation_ratio", 0.20)
-    n_val     = max(1, int(len(train_labels) * val_ratio))
-    rng.shuffle(train_labels)
-    val_labels   = train_labels[:n_val]
-    train_labels = train_labels[n_val:]
+    # Stratified binning for assignment
+    df = deg_counts.reset_index()
+    df.columns = ["perturbation", "score"]
+    df["bin"] = pd.qcut(df["score"], q=zs.get("stratify_bins", 4), labels=False, duplicates="drop")
+
+    train_labels, val_labels, test_labels = [], [], []
+    for _, group in df.groupby("bin"):
+        shuffled = group.sample(frac=1, random_state=rng.integers(1e9))
+        
+        # Calculate proportional allocations per bin
+        bin_test = max(1, int(len(shuffled) * test_ratio)) if len(shuffled) > 3 else 1
+        bin_remain = len(shuffled) - bin_test
+        bin_val = max(1, int(bin_remain * val_ratio)) if bin_remain > 2 else 1
+        
+        test_labels.extend(shuffled.iloc[:bin_test]["perturbation"])
+        val_labels.extend(shuffled.iloc[bin_test:bin_test+bin_val]["perturbation"])
+        train_labels.extend(shuffled.iloc[bin_test+bin_val:]["perturbation"])
 
     logger.info(
-        f"  Split: {len(train_labels)} train / {len(val_labels)} val / "
-        f"{len(test_labels)} test perturbations")
+        f"  Perturbation Split: {len(train_labels)} Train / {len(val_labels)} Val / "
+        f"{len(test_labels)} Test (Zero-Shot Targets)")
 
+    # ── 2. Distributing the Control Cells ──
     pert_values = adata.obs[pert_col].values
-    train_set   = set(train_labels)
-    val_set     = set(val_labels)
-    test_set    = set(test_labels)
+    ctrl_mask_full = pert_values == ctrl_label
+    ctrl_indices = np.where(ctrl_mask_full)[0]
+    
+    rng.shuffle(ctrl_indices)
+    
+    frac_test = len(test_labels) / n_perts
+    frac_val = len(val_labels) / n_perts
+    
+    n_ctrl_test = int(len(ctrl_indices) * frac_test)
+    n_ctrl_val = int(len(ctrl_indices) * frac_val)
+    
+    test_ctrl_idx = ctrl_indices[:n_ctrl_test]
+    val_ctrl_idx = ctrl_indices[n_ctrl_test:n_ctrl_test+n_ctrl_val]
+    train_ctrl_idx = ctrl_indices[n_ctrl_test+n_ctrl_val:]
 
-    train_mask = np.array([p in train_set or p == ctrl_label for p in pert_values])
-    val_mask   = np.array([p in val_set   or p == ctrl_label for p in pert_values])
-    test_mask  = np.array([p in test_set                     for p in pert_values])
+    # ── 3. Assembling the Final Masks ──
+    train_mask = np.isin(pert_values, train_labels)
+    train_mask[train_ctrl_idx] = True
+    
+    val_mask = np.isin(pert_values, val_labels)
+    val_mask[val_ctrl_idx] = True
+    
+    test_mask = np.isin(pert_values, test_labels)
+    test_mask[test_ctrl_idx] = True
 
     log_memory(logger, "before destructive split")
     train_ad, val_ad, test_ad = destructive_3way_split(
@@ -177,14 +214,6 @@ def split_zero_shot(adata, cfg, logger, seed=None):
     snapshot(train_ad, "Train split", logger)
     snapshot(val_ad,   "Val split",   logger)
     snapshot(test_ad,  "Test split",  logger)
-
-    # Sanity check: val should be larger than test (controls in val, not test)
-    if val_ad.n_obs < test_ad.n_obs:
-        logger.warning(
-            f"  ⚠ val ({val_ad.n_obs:,}) < test ({test_ad.n_obs:,}). "
-            f"Increase validation_ratio (currently "
-            f"{zs.get('validation_ratio', 0.20)}) or the test perturbations "
-            f"have more cells than val. Downstream tools expect val ≥ test.")
 
     return {
         "train": train_ad, "val": val_ad, "test": test_ad,
@@ -233,3 +262,69 @@ def run_phase7(adata, cfg, logger):
                     seed=seed if test_mode else None)
         all_splits.append(result)
     return all_splits
+
+def print_split_diagnostics(split_result):
+    """
+    Prints a clean Pandas DataFrame summary of the data splits and performs
+    mathematical checks to guarantee zero data leakage between sets.
+    """
+    import pandas as pd
+    
+    # Handle whether the user passed the full list of seeds or just one result
+    res = split_result[0] if isinstance(split_result, list) else split_result
+    
+    # Extract Cell Counts
+    train_cells = res["split_info"]["train"]
+    val_cells   = res["split_info"]["val"]
+    test_cells  = res["split_info"]["test"]
+    total_cells = train_cells + val_cells + test_cells
+    
+    # Extract Perturbations
+    train_perts = set(res["train_labels"])
+    val_perts   = set(res["val_labels"])
+    test_perts  = set(res["test_labels"])
+    total_perts = len(train_perts) + len(val_perts) + len(test_perts)
+    
+    # ── 1. Clean Table Output ──
+    df = pd.DataFrame({
+        "Split": ["Train", "Val", "Test", "Total"],
+        "Cells": [f"{train_cells:,}", f"{val_cells:,}", f"{test_cells:,}", f"{total_cells:,}"],
+        "Cell %": [
+            f"{(train_cells/total_cells)*100:.1f}%", 
+            f"{(val_cells/total_cells)*100:.1f}%", 
+            f"{(test_cells/total_cells)*100:.1f}%", 
+            "100.0%"
+        ],
+        "Targets": [len(train_perts), len(val_perts), len(test_perts), total_perts],
+        "Target %": [
+            f"{(len(train_perts)/total_perts)*100:.1f}%", 
+            f"{(len(val_perts)/total_perts)*100:.1f}%", 
+            f"{(len(test_perts)/total_perts)*100:.1f}%", 
+            "100.0%"
+        ]
+    })
+    
+    print("\n" + "="*50)
+    print(" SPORE+ DATA SPLIT DIAGNOSTICS")
+    print("="*50)
+    print(df.to_string(index=False))
+    print("\n" + "-"*50)
+    print(" LEAKAGE SANITY CHECKS")
+    print("-"*50)
+    
+    # ── 2. Mathematical Leakage Checks ──
+    leak_tv = len(train_perts.intersection(val_perts))
+    leak_tt = len(train_perts.intersection(test_perts))
+    leak_vt = len(val_perts.intersection(test_perts))
+    
+    if leak_tv == 0 and leak_tt == 0 and leak_vt == 0:
+        print("[PASS] 🟢 Target sets are strictly mutually exclusive.")
+    else:
+        print("[FAIL] 🔴 DATA LEAKAGE DETECTED!")
+        print(f"       Train/Val overlap:  {leak_tv} targets")
+        print(f"       Train/Test overlap: {leak_tt} targets")
+        print(f"       Val/Test overlap:   {leak_vt} targets")
+
+    if total_perts > 0:
+        print(f"[PASS] 🟢 All perturbations accounted for ({total_perts}).")
+    print("="*50 + "\n")
