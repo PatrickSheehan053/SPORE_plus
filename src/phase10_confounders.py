@@ -435,10 +435,6 @@ def run_phase10_subprocess(train_p9_path, output_dir, cfg, logger,
     """
     Launch phase10_worker.py (a thin CLI shim over run_worker_logic) in a
     fresh subprocess with allocator-safe environment variables set.
-
-    MALLOC_MMAP_THRESHOLD_=134217728 forces all arrays >128 MB to use mmap()
-    instead of brk(). On free(), mmap'd pages are returned to the OS via
-    munmap() atomically — no arena pinning, no ghost RAM.
     """
     output_dir = Path(output_dir)
     splits_dir = cfg["paths"]["_splits"]
@@ -448,10 +444,9 @@ def run_phase10_subprocess(train_p9_path, output_dir, cfg, logger,
     embed_path = str(output_dir / f"{name}_train_p10_embed.npz")
     obs_path   = str(output_dir / f"{name}_train_p10_obs.parquet")
 
-    batch_key  = (cfg.get("phase10_confounders", {})
-                     .get("batch_correction", {})
-                     .get("batch_key",
-                          cfg.get("dataset", {}).get("batch_col", "gem_group")))
+    # THE ARCHITECTURE FIX: Strictly read from the dataset config. 
+    # Ignores all old/nested phase10 defaults.
+    batch_key  = cfg.get("dataset", {}).get("batch_col", "gem_group")
 
     worker = str(Path(__file__).parent / "phase10_worker.py")
     if not os.path.exists(worker):
@@ -461,10 +456,10 @@ def run_phase10_subprocess(train_p9_path, output_dir, cfg, logger,
 
     child_env = os.environ.copy()
     child_env.update({
-        "MALLOC_MMAP_THRESHOLD_": "134217728",   # 128 MB → all large arrays use mmap
-        "MALLOC_ARENA_MAX":       "2",            # 2 arenas instead of 8×nCPU
-        "MALLOC_TRIM_THRESHOLD_": "131072",       # 128 KB trim threshold
-        "OPENBLAS_NUM_THREADS":   "1",            # prevent per-thread arena explosion
+        "MALLOC_MMAP_THRESHOLD_": "134217728",   
+        "MALLOC_ARENA_MAX":       "2",            
+        "MALLOC_TRIM_THRESHOLD_": "131072",       
+        "OPENBLAS_NUM_THREADS":   "1",            
         "MKL_NUM_THREADS":        "1",
         "OMP_NUM_THREADS":        "1",
         "NUMEXPR_NUM_THREADS":    "1",
