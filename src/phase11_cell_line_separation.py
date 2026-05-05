@@ -403,3 +403,84 @@ def run_phase11(adata, cfg: dict, logger):
     snapshot(adata, "Post Phase 11 Cell Line Detection", logger)
     log_memory(logger, "Phase 11 end")
     return adata, detection_meta
+
+def generate_pca_diagnostic_table(adata_p10, cfg, top_n=5):
+    """
+    Extracts the top genes driving PC1, PC2, and PC3 via PCA loadings,
+    then calculates their mean normalized expression per cell line
+    by reading lazily from the backed Phase 9 disk file.
+    """
+    import anndata as ad
+    import pandas as pd
+    import numpy as np
+    
+    if "pca" not in adata_p10.uns or "components" not in adata_p10.uns["pca"]:
+        print("PCA components not found. Cannot generate diagnostic table.")
+        return None
+
+    components = adata_p10.uns["pca"]["components"]  # Shape: (n_pcs, n_genes)
+    
+    # Ensure we actually have 3 PCs to evaluate
+    if components.shape[0] < 3:
+        print("Less than 3 Principal Components available in the model.")
+        return None
+
+    # Setup path to the full normalized data on disk
+    dataset_name = cfg.get("dataset", {}).get("name", "dataset")
+    splits_dir   = cfg.get("paths", {}).get("_splits", cfg.get("paths", {}).get("splits_dir"))
+    p9_path      = f"{splits_dir}/{dataset_name}_train_p9.h5ad"
+    
+    try:
+        # Open in backed mode (0 GB RAM used)
+        adata_p9 = ad.read_h5ad(p9_path, backed='r')
+        gene_names = np.array(adata_p9.var_names)
+    except FileNotFoundError:
+        print(f"Could not find {p9_path} on disk. Make sure Phase 9 was saved.")
+        return None
+
+    # Get the indices of the highest absolute weights for PC1, PC2, and PC3
+    top_pc1_idx = np.argsort(np.abs(components[0]))[-top_n:][::-1]
+    top_pc2_idx = np.argsort(np.abs(components[1]))[-top_n:][::-1]
+    top_pc3_idx = np.argsort(np.abs(components[2]))[-top_n:][::-1]
+    
+    top_genes_pc1 = gene_names[top_pc1_idx]
+    top_genes_pc2 = gene_names[top_pc2_idx]
+    top_genes_pc3 = gene_names[top_pc3_idx]
+    
+    # Combine into a unique set so we only pull distinct genes from the disk once
+    target_genes = list(set(top_genes_pc1) | set(top_genes_pc2) | set(top_genes_pc3))
+
+    print(f"Extracting expression for {len(target_genes)} driver genes from disk...")
+    
+    # Load ONLY the target genes into memory
+    expr_chunk = adata_p9[:, target_genes].to_memory()
+    expr_chunk.obs["cell_line"] = adata_p10.obs["sporeplus_cell_line"].values
+    
+    # Compute mean expression per cell line
+    df_expr = pd.DataFrame(
+        expr_chunk.X.toarray() if hasattr(expr_chunk.X, "toarray") else expr_chunk.X, 
+        columns=target_genes
+    )
+    df_expr["Cell Line"] = expr_chunk.obs["cell_line"].values
+    mean_expr = df_expr.groupby("Cell Line").mean().T
+
+    # Format the final diagnostic table
+    records = []
+    
+    # Iterate through all three PCs
+    pc_data = [
+        ("PC1", top_genes_pc1, components[0][top_pc1_idx]), 
+        ("PC2", top_genes_pc2, components[1][top_pc2_idx]),
+        ("PC3", top_genes_pc3, components[2][top_pc3_idx])
+    ]
+    
+    for pc, top_genes, weights in pc_data:
+        for gene, weight in zip(top_genes, weights):
+            row = {"Principal Component": pc, "Driver Gene": gene, "Loading Weight": round(weight, 3)}
+            # Add the mean expression values
+            for cl in mean_expr.columns:
+                row[f"{cl} (Mean CP10k)"] = round(mean_expr.loc[gene, cl], 2)
+            records.append(row)
+
+    diag_df = pd.DataFrame(records)
+    return diag_df
