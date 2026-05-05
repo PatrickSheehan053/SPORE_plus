@@ -13,7 +13,7 @@ MILESTONE 2 UPGRADE — Efficiency Scoring:
   These are stored in adata.uns["knockdown_efficiency"] and added as per-cell
   obs columns: 'escaper_efficiency', 'escaper_knockdown_depth'.
 
-  This gives a per-perturbation quality readout that CHITIN can weight downstream.
+  This gives a per-pertforurbation quality readout that CHITIN can weight downstream.
 
 CRISPRa DIRECTION FIX (Milestone 1):
   For knockdown (CRISPRi/ko): keep cells ≤ Nth percentile of controls
@@ -111,20 +111,23 @@ def filter_escapers(adata, cfg: dict, logger):
             else:
                 pert_expr = np.asarray(pert_expr).flatten()
 
+            # ── FIX 1: Calculate TRUE Knockdown Depth on ALL cells (No Survivor Bias) ──
+            ctrl_mean = ctrl_expr.mean()
+            if ctrl_mean > 1e-10:
+                # This represents the actual biological efficiency of the guide
+                true_fold_change = pert_expr.mean() / ctrl_mean
+                knockdown_depths.append(true_fold_change)
+
+            # ── FIX 2: Apply Escaper Filter safely ──
             if direction == "knockdown":
                 threshold = np.percentile(ctrl_expr, percentile)
                 gene_pass = pert_expr <= threshold
-                ctrl_mean = ctrl_expr.mean()
-                if ctrl_mean > 1e-10:
-                    kept_mean = pert_expr[gene_pass].mean() if gene_pass.any() else 0
-                    knockdown_depths.append(kept_mean / ctrl_mean)
             else:
                 threshold = np.percentile(ctrl_expr, 100 - percentile)
+                # Prevent the zero-inflation bug for sparse genes in CRISPRa
+                if threshold == 0:
+                    threshold = 1e-5 
                 gene_pass = pert_expr >= threshold
-                ctrl_mean = ctrl_expr.mean()
-                if ctrl_mean > 1e-10:
-                    kept_mean = pert_expr[gene_pass].mean() if gene_pass.any() else 0
-                    knockdown_depths.append(kept_mean / ctrl_mean)
 
             pass_mask &= gene_pass
 
