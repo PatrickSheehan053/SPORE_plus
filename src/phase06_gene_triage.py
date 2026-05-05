@@ -67,22 +67,26 @@ def filter_genes(adata, cfg: dict, logger):
         f"{n_ambient:,} genes flagged")
     waterfall["After ambient filter"] = int(keep_genes.sum())
 
-    # ── 2. Scale-adaptive filter ───────────────────────────────────────────
+    # ── 2. Scale-adaptive filter (REFINED) ─────────────────────────────────
     n_cells = adata.n_obs
-    if n_cells < p6.get("small_dataset_threshold", 50000):
-        pct_thresh = p6.get("pct_filter", 0.05)
-        min_cells_adaptive = int(n_cells * pct_thresh)
-        adaptive_fail = cells_per_gene < min_cells_adaptive
-        logger.info(
-            f"  Scale-adaptive: small dataset mode "
-            f"(≥{pct_thresh*100:.0f}% = {min_cells_adaptive:,} cells)")
-    else:
-        umi_thresh    = p6.get("mean_umi_threshold", 0.25)
-        adaptive_fail = mean_expr < umi_thresh
-        logger.info(
-            f"  Scale-adaptive: large dataset mode "
-            f"(mean UMI ≥ {umi_thresh})")
+    
+    # Standard: Keep genes expressed in at least 1% of cells 
+    # (If your YAML passes 0.05, it will use that, but 0.01 is recommended for 400k+ cells)
+    pct_thresh = p6.get("pct_filter", 0.01) 
+    min_cells_adaptive = max(min_cells, int(n_cells * pct_thresh))
+    
+    # We combine both: Gene must pass a basic count floor OR a mean UMI floor
+    umi_thresh = p6.get("mean_umi_threshold", 0.05) 
+    
+    # A gene FAILS only if it fails BOTH consistency (cells_per_gene) 
+    # AND intensity (mean_expr)
+    adaptive_fail = (cells_per_gene < min_cells_adaptive) & (mean_expr < umi_thresh)
+    
+    logger.info(
+        f"  Scale-adaptive: Keep genes in >{pct_thresh*100:.1f}% cells "
+        f"({min_cells_adaptive:,} cells) OR mean UMI > {umi_thresh}")
 
+    # ── THE FIX: Declare the missing variable and update the waterfall ──
     would_remove = ~keep_genes | adaptive_fail
     waterfall["After adaptive (pre-rescue)"] = int((~would_remove).sum())
 
@@ -128,6 +132,17 @@ def filter_genes(adata, cfg: dict, logger):
 
     # CRITICAL (Error 010): row-by-row C-buffer column reconstructor
     adata_new = safe_in_memory_gene_subset(adata, keep_mask=final_keep, logger=logger)
+
+    # ── THE FIX: Permanently attach the pre-filter stats to the metadata ──
+    # We calculate the original sparsity array here
+    if sp.issparse(X):
+        orig_pct_cells = (X.getnnz(axis=0) / adata.n_obs) * 100
+    else:
+        orig_pct_cells = ((X > 0).sum(axis=0) / adata.n_obs) * 100
+        
+    adata_new.uns["phase6_waterfall"] = dict(waterfall)
+    adata_new.uns["phase6_gene_penetrance"] = np.float32(orig_pct_cells)
+    # ──────────────────────────────────────────────────────────────────────
 
     snapshot(adata_new, "Post Phase 6", logger)
     return adata_new, waterfall, rescued
