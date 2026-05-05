@@ -205,11 +205,16 @@ def _scrublet_large(X, n_cells, max_sim_cells,
         from sklearn.decomposition import TruncatedSVD
         from sklearn.neighbors import KNeighborsRegressor
 
-        # 1. Learn a quick PCA space on the log-normalized subsample
-        X_sub_log = np.log1p(X_sub)
+        # 1. Learn a stable PCA space on the NORMALIZED subsample
+        # Must library-size normalize so PCA captures cell state, not just read depth
+        sub_sums = X_sub.sum(axis=1, keepdims=True)
+        sub_sums[sub_sums == 0] = 1.0
+        X_sub_norm = (X_sub / sub_sums) * 10000.0
+        X_sub_log = np.log1p(X_sub_norm)
+        
         svd = TruncatedSVD(n_components=n_pcs, random_state=42)
         obs_pca = svd.fit_transform(X_sub_log)
-        del X_sub_log
+        del X_sub_norm, X_sub_log
 
         # 2. Train a parallel KNN Regressor to propagate the Scrublet scores
         log.info(f"  [Scrublet] Training parallel KNN regressor (n_jobs={n_jobs})...")
@@ -229,8 +234,11 @@ def _scrublet_large(X, n_cells, max_sim_cells,
             else:
                 xb = X[idx_b].astype(np.float32)
 
-            # Project batch onto the learned SVD space
-            xb_pca = svd.transform(np.log1p(xb))
+            # Normalize and project batch onto the learned SVD space
+            xb_sums = xb.sum(axis=1, keepdims=True)
+            xb_sums[xb_sums == 0] = 1.0
+            xb_norm = (xb / xb_sums) * 10000.0
+            xb_pca = svd.transform(np.log1p(xb_norm))
 
             # Predict exact scrublet score based on transcriptional neighborhood
             all_scores[idx_b] = knn.predict(xb_pca).astype(np.float32)
