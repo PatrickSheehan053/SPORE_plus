@@ -95,6 +95,7 @@ class ChitinModel:
     def __init__(self):
         # KNN state
         self.pca_components   = None   # (n_genes × n_pcs) PCA loadings
+        self.pca_mean         = None   # (n_genes,) Training mean for geometric alignment
         self.nn_model         = None   # fitted NearestNeighbors on ctrl PCA
         self.X_ctrl_expr      = None   # (n_ctrl × n_genes) control expression
         self.k                = None
@@ -184,28 +185,48 @@ class ChitinModel:
 
         solver = cfg["knn"]["svd_solver"]
 
-        # ── Compute PCA with selected n_pcs ───────────────────────────────
+        # ── Compute PCA with exact Training Mean Alignment ────────────────
         logger.info(f"  Computing PCA ({self.n_pcs} PCs, solver={solver})...")
-        adata_work = adata.copy()
-        sc.pp.scale(adata_work, max_value=10, zero_center=False)
-        sc.pp.pca(adata_work, n_comps=self.n_pcs, use_highly_variable=False,
-                  svd_solver=solver, zero_center=False)
+        
+        # 1. Extract raw training matrix and compute training mean
+        X_train = adata.X
+        if sp.issparse(X_train):
+            X_train = X_train.toarray()
+        X_train = X_train.astype(np.float32)
+        
+        self.pca_mean = X_train.mean(axis=0)
+        
+        # 2. Mean-center the training data explicitly
+        X_centered = X_train - self.pca_mean
+        
+        # 3. Fit PCA natively using sklearn to guarantee exact V.T extraction
+        from sklearn.decomposition import PCA, TruncatedSVD
+        if solver == "arpack":
+            pca_engine = TruncatedSVD(n_components=self.n_pcs, random_state=42)
+        else:
+            pca_engine = PCA(n_components=self.n_pcs, svd_solver=solver, random_state=42)
+            
+        adata.obsm["X_pca_chitin"] = pca_engine.fit_transform(X_centered).astype(np.float32)
+        
+        # pca_engine.components_ is (n_pcs x n_genes). We transpose it to match your (n_genes x n_pcs) logic.
+        self.pca_components = pca_engine.components_.T.astype(np.float32)
 
-        adata.obsm["X_pca_chitin"] = adata_work.obsm["X_pca"].copy()
-        if "pca" in adata_work.uns:
-            adata.uns["chitin_pca_variance_ratio"] = \
-                adata_work.uns["pca"]["variance_ratio"]
+        # 4. Save the explicitly centered matrix for V computation in PC decomp
+        if self.correction_mode in ("pc_decomposition", "hybrid"):
+            X_scaled_for_V = X_centered
+        else:
+            X_scaled_for_V = None
 
-        if hasattr(adata_work, "varm") and "PCs" in adata_work.varm:
-            self.pca_components = adata_work.varm["PCs"].copy()  # (n_genes × n_pcs)
-
-        del adata_work
         force_gc(logger)
 
         # ── PC decomposition: identify systematic PCs ─────────────────────
         if self.correction_mode in ("pc_decomposition", "hybrid"):
-            logger.info("  Identifying systematic PCs via V-alignment...")
-            self._fit_pc_decomposition(adata, cfg, logger, ctrl_idx, pert_idx)
+            logger.info("  Identifying systematic PCs via V-alignment (scaled space)...")
+            self._fit_pc_decomposition(
+                adata, cfg, logger, ctrl_idx, pert_idx,
+                X_scaled=X_scaled_for_V)
+            del X_scaled_for_V
+            gc.collect()
 
         # ── KNN on control PCA coords ─────────────────────────────────────
         if self.correction_mode in ("knn", "hybrid"):
@@ -230,6 +251,18 @@ class ChitinModel:
         else:
             self.X_ctrl_expr = np.array(X[ctrl_idx], dtype=np.float32)
 
+        # Fix 2 (Hybrid Contradiction): project systematic PCs out of the
+        # control reference matrix so it lives on the same purified manifold
+        # as the perturbed residuals during transform().
+        # Without this: delta = X_pert_projected - X_ctrl_raw re-injects
+        # the systematic variance that was just projected out.
+        if (self.correction_mode == "hybrid" and
+                len(self.systematic_pc_indices) > 0):
+            logger.info("  Hybrid mode: applying PC correction to control "
+                        "reference matrix (purifying ctrl manifold)...")
+            self.X_ctrl_expr = self._apply_pc_correction(
+                self.X_ctrl_expr, logger, "  [ctrl-ref]")
+
         self.is_fitted = True
         logger.info("  CHITIN v2 model fitted.")
         log_memory(logger, "post fit")
@@ -239,7 +272,8 @@ class ChitinModel:
     # PC DECOMPOSITION FIT
     # ─────────────────────────────────────────────────────────────────────
 
-    def _fit_pc_decomposition(self, adata, cfg, logger, ctrl_idx, pert_idx):
+    def _fit_pc_decomposition(self, adata, cfg, logger, ctrl_idx, pert_idx,
+                              X_scaled=None):
         """
         Identify which PCs encode systematic variation by comparing their
         loading vectors against the systematic variation vector V.
@@ -249,12 +283,20 @@ class ChitinModel:
         A PC is classified as systematic if:
           cosine_similarity(PC_loading, V) > PC_SYSTEMATIC_COS_THRESHOLD
 
-        The PC loading vectors are normalised before comparison.
+        Fix 1 (Space Mismatch): X_scaled must be the same scaled matrix that
+        was passed to sc.pp.pca. PC loading vectors are directions in SCALED
+        gene space (units of std-normalized expression). Computing V from
+        raw adata.X (units of raw counts) gives a vector in a different
+        coordinate system, making the cosine similarities meaningless.
         """
-        X = adata.X
-        if sp.issparse(X):
-            X = X.toarray()
-        X = X.astype(np.float32)
+        if X_scaled is not None:
+            X = X_scaled.astype(np.float32)
+        else:
+            # Fallback (standalone mode, no pre-scaled matrix available)
+            X = adata.X
+            if sp.issparse(X):
+                X = X.toarray()
+            X = np.clip(X.astype(np.float32), None, 10.0)
 
         C_ctrl = X[ctrl_idx].mean(axis=0)
         O_pert = X[pert_idx].mean(axis=0)
@@ -363,14 +405,24 @@ class ChitinModel:
         for n_pcs in npcs_grid:
             # Cache PCA computation per n_pcs value
             if n_pcs not in best_pca_cache:
-                adata_w = adata.copy()
-                sc.pp.scale(adata_w, max_value=10, zero_center=False)
-                sc.pp.pca(adata_w, n_comps=n_pcs, use_highly_variable=False,
-                          svd_solver=solver, zero_center=False)
-                pca_all  = adata_w.obsm["X_pca"].copy()
-                pca_loadings = adata_w.varm["PCs"].copy() \
-                    if "PCs" in adata_w.varm else None
-                del adata_w
+                # ── Must mirror the exact mean-centering logic from fit() ──
+                X_train_sweep = adata.X
+                if sp.issparse(X_train_sweep):
+                    X_train_sweep = X_train_sweep.toarray()
+                X_train_sweep = X_train_sweep.astype(np.float32)
+                
+                sweep_pca_mean = X_train_sweep.mean(axis=0)
+                X_sweep_centered = X_train_sweep - sweep_pca_mean
+                
+                from sklearn.decomposition import PCA, TruncatedSVD
+                if solver == "arpack":
+                    pca_engine = TruncatedSVD(n_components=n_pcs, random_state=42)
+                else:
+                    pca_engine = PCA(n_components=n_pcs, svd_solver=solver, random_state=42)
+                
+                pca_all = pca_engine.fit_transform(X_sweep_centered).astype(np.float32)
+                pca_loadings = pca_engine.components_.T.astype(np.float32)
+                
                 best_pca_cache[n_pcs] = (pca_all, pca_loadings)
             else:
                 pca_all, pca_loadings = best_pca_cache[n_pcs]
@@ -484,6 +536,13 @@ class ChitinModel:
         post_mean = float(np.mean(post_d))    if len(post_d)  > 0 else pre_mean
         disc_ratio = post_mean / (pre_mean + 1e-10)
 
+        # Fix 3 (Pareto Misalignment): transform disc_ratio into a bounded
+        # preservation score that is maximized when ratio is closest to 1.0.
+        # Raw disc_ratio is kept for logging/reporting; the optimizer uses
+        # disc_preservation. Without this fix, k=1 scored disc_ratio=49.78
+        # (50× manifold fragmentation) and was incorrectly selected as "best".
+        disc_preservation = 1.0 / (1.0 + abs(disc_ratio - 1.0))
+
         return {
             "k":                  k,
             "n_pcs":              n_pcs,
@@ -491,6 +550,7 @@ class ChitinModel:
             "rank_disruption":    disruption,
             "mean_rho":           mean_rho,
             "disc_ratio":         disc_ratio,
+            "disc_preservation":  disc_preservation,   # fix 3: used by Pareto
             "signal_stability":   signal_stab,
             "delta_norm_mean":    float(delta_norms.mean()),
             "delta_norm_std":     float(delta_norms.std()),
@@ -558,9 +618,45 @@ class ChitinModel:
         else:
             raise ValueError(f"Unknown correction_mode: {self.correction_mode}")
 
+        # ── Apply intra-control KNN subtraction (Fix 4: prevent variance collapse)
+        # Without this, every control cell gets X_delta = 0.0.
+        # Tree-based GRN models (LightGBM) see a point-mass reference class
+        # with zero variance → zero information gain → overfitting.
+        # Fix: for each control cell, subtract the mean of its k nearest
+        # training-control neighbors, preserving natural stochastic variation.
+        # ── Apply intra-control KNN subtraction (Preserving Basal Variance) ──
+        delta_ctrl = None
+        if (len(ctrl_indices) > 0 and self.nn_model is not None and
+                self.X_ctrl_expr is not None):
+            n_ctrl_local = len(ctrl_indices)
+            pca_ctrl_local = adata.obsm["X_pca_chitin"][ctrl_indices]
+            
+            # Request k+1 neighbors to safely handle both Train and Val/Test splits
+            k_for_ctrl = min(self.k + 1, len(self.X_ctrl_expr))
+            if k_for_ctrl >= 2:
+                distances, ctrl_nbr_idx = self.nn_model.kneighbors(
+                    pca_ctrl_local, n_neighbors=k_for_ctrl)
+                
+                X_ctrl_local = X[ctrl_indices].astype(np.float32)
+                N_ctrl = np.zeros((n_ctrl_local, n_genes), dtype=np.float32)
+                
+                for ci in range(n_ctrl_local):
+                    # DYNAMIC MASKING: Only drop the 0th index if distance is near-zero (Self-Match in Train split)
+                    if distances[ci, 0] < 1e-7:
+                        valid_idx = ctrl_nbr_idx[ci, 1:self.k+1]
+                    else:
+                        # Val/Test split: 0th index is the actual closest valid training reference
+                        valid_idx = ctrl_nbr_idx[ci, 0:self.k]
+                        
+                    N_ctrl[ci] = self.X_ctrl_expr[valid_idx].mean(axis=0)
+                    
+                delta_ctrl = X_ctrl_local - N_ctrl
+
         # ── Build output AnnData ──────────────────────────────────────────
         X_delta = np.zeros((adata.n_obs, n_genes), dtype=np.float32)
         X_delta[pert_indices] = delta_pert
+        if delta_ctrl is not None:
+            X_delta[ctrl_indices] = delta_ctrl
 
         adata_delta = ad.AnnData(
             X=X_delta,
@@ -638,24 +734,19 @@ class ChitinModel:
         return X_corr
 
     def _project_to_pca(self, adata, cfg, logger):
-        """Project into the training PCA space (or compute fresh if needed)."""
-        if self.pca_components is not None:
+        """Project into the training PCA space using the fitted training mean."""
+        if self.pca_components is not None and self.pca_mean is not None:
             X = adata.X
             if sp.issparse(X):
                 X = X.toarray()
-            X_scaled = np.clip(X.astype(np.float32), None, 10)
-            adata.obsm["X_pca_chitin"] = X_scaled @ self.pca_components
+            X = X.astype(np.float32)
+            
+            # Geometrically align unseen data to the training origin
+            X_centered = X - self.pca_mean
+            adata.obsm["X_pca_chitin"] = X_centered @ self.pca_components
         else:
-            logger.info("  No stored PCA — computing fresh (standalone mode)...")
-            n_pcs  = self.n_pcs or cfg["knn"]["n_pcs"]
-            solver = cfg["knn"]["svd_solver"]
-            adata_work = adata.copy()
-            sc.pp.scale(adata_work, max_value=10, zero_center=False)
-            sc.pp.pca(adata_work, n_comps=n_pcs, use_highly_variable=False,
-                      svd_solver=solver, zero_center=False)
-            adata.obsm["X_pca_chitin"] = adata_work.obsm["X_pca"].copy()
-            del adata_work
-            force_gc(logger)
+            raise RuntimeError("PCA components or training mean missing. Model not fitted properly.")
+        
         return adata
 
 
@@ -698,13 +789,17 @@ def _fast_pairwise_cosine(X_pert, cfg, pert_col, ctrl_label,
 def _compute_pareto_front(df):
     """
     Identify Pareto-optimal points across three objectives:
-      - rank_disruption  (maximise)
-      - disc_ratio       (maximise — higher = perturbations more separable post)
-      - signal_stability (maximise)
+      - rank_disruption   (maximise)
+      - disc_preservation (maximise — = 1/(1+|disc_ratio-1|), peaks at ratio=1)
+      - signal_stability  (maximise)
 
-    A point is Pareto-dominated if another point is better on ALL three.
+    Fix 3 (Pareto Misalignment): uses disc_preservation, not raw disc_ratio.
+    Maximising disc_preservation drives disc_ratio toward 1.0 (topology
+    preserved). Maximising raw disc_ratio favoured k=1 with ratio=49.78
+    (manifold fragmentation).
     """
-    vals = df[["rank_disruption", "disc_ratio", "signal_stability"]].values
+    col = "disc_preservation" if "disc_preservation" in df.columns else "disc_ratio"
+    vals = df[["rank_disruption", col, "signal_stability"]].values
     n    = len(vals)
     dominated = np.zeros(n, dtype=bool)
 
@@ -740,9 +835,10 @@ def _select_from_pareto(pareto_df, all_df, cfg, logger):
     if len(candidates) == 0:
         candidates = pareto_df
 
-    # Among candidates, maximise rank_disruption, break ties on disc_ratio
+    # Among candidates, maximise rank_disruption, break ties on disc_preservation
+    sort_col = "disc_preservation" if "disc_preservation" in candidates.columns else "disc_ratio"
     candidates = candidates.sort_values(
-        ["rank_disruption", "disc_ratio"], ascending=[False, False])
+        ["rank_disruption", sort_col], ascending=[False, False])
     best = candidates.iloc[0]
 
     logger.info(f"  Pareto selection: k={int(best['k'])}, "
