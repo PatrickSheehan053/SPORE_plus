@@ -97,9 +97,16 @@ def filter_cells(adata, cfg: dict, logger):
         f"removed {before - keep_cells.sum():,}")
     waterfall["After max counts"] = int(keep_cells.sum())
 
-    # ── Ribosomal gene removal ─────────────────────────────────────────────
-    ribo_prefixes = tuple(p2.get("ribo_prefixes", ["RPL", "RPS"]))
-    keep_genes = ~adata.var_names.str.startswith(ribo_prefixes)
+        # ── Ribosomal gene removal ─────────────────────────────────────────────
+    # Force case-insensitivity to handle both Human (RPL) and Mouse (Rpl)
+    raw_prefixes = p2.get("ribo_prefixes", ["RPL", "RPS"])
+    upper_prefixes = tuple(p.upper() for p in raw_prefixes)
+    
+    keep_genes = ~adata.var_names.str.upper().str.startswith(upper_prefixes)
+    n_ribo = (~keep_genes).sum()
+    logger.info(
+        f"  Ribosomal gene removal: {n_ribo:,} genes stripped "
+        f"(using prefixes: {raw_prefixes})")
     n_ribo = (~keep_genes).sum()
     logger.info(
         f"  Ribosomal gene removal: {n_ribo:,} genes stripped")
