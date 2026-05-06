@@ -393,15 +393,6 @@ def _detect_cell_line_column(adata, cfg, logger):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _handle_cite_seq(adata, logger):
-    """
-    For CITE-seq data: split RNA and ADT features.
-    Parks ADT in adata.obsm['X_adt'] and returns RNA-only AnnData.
-
-    CRITICAL: ADT features have completely different count distributions
-    than RNA. They MUST be removed before HVG selection and normalization
-    or they will silently distort both the RNA and ADT data.
-    """
-    import anndata as ad
     import scipy.sparse as sp
 
     if "feature_types" not in adata.var.columns:
@@ -415,35 +406,26 @@ def _handle_cite_seq(adata, logger):
     if n_adt == 0:
         return adata
 
-    logger.info(
-        f"  CITE-seq: separating {n_rna:,} RNA features from "
-        f"{n_adt:,} ADT features")
+    logger.info(f"  CITE-seq: separating {n_rna:,} RNA features from {n_adt:,} ADT features")
 
-    # Park ADT in obsm for potential future use
+    # Park ADT in obsm natively as sparse to prevent RAM explosion
     X_adt = adata.X[:, adt_mask]
-    if sp.issparse(X_adt):
-        X_adt = X_adt.toarray()
+    if sp.issparse(X_adt) and not sp.isspmatrix_csr(X_adt):
+        X_adt = X_adt.tocsr()
+    
     adata.obsm["X_adt"] = X_adt
     adata.uns["adt_var_names"] = list(adata.var_names[adt_mask])
+    logger.info(f"  CITE-seq: ADT matrix parked natively in obsm['X_adt']")
 
-    logger.info(f"  CITE-seq: ADT matrix parked in obsm['X_adt']")
-
-    # Return RNA-only object using safe gene subset
     from .utils import safe_in_memory_gene_subset
     adata = safe_in_memory_gene_subset(adata, keep_mask=rna_mask, logger=logger)
-    logger.info(f"  CITE-seq: RNA-only matrix retained ({n_rna:,} features)")
     return adata
-
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  MULTIOME HANDLING
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _handle_multiome(adata, logger):
-    """
-    For Multiome data: park ATAC peaks in obsm['X_atac_peaks'],
-    keep only RNA features in adata.X.
-    """
     import re
     import scipy.sparse as sp
 
@@ -454,21 +436,19 @@ def _handle_multiome(adata, logger):
     if atac_mask.sum() == 0:
         return adata
 
-    logger.info(
-        f"  Multiome: separating {rna_mask.sum():,} RNA features from "
-        f"{atac_mask.sum():,} ATAC peaks")
+    logger.info(f"  Multiome: separating {rna_mask.sum():,} RNA features from {atac_mask.sum():,} ATAC peaks")
 
+    # Park ATAC in obsm natively as sparse to prevent OOM crash
     X_atac = adata.X[:, atac_mask]
-    if sp.issparse(X_atac):
-        X_atac = X_atac.toarray().astype("float32")
+    if sp.issparse(X_atac) and not sp.isspmatrix_csr(X_atac):
+        X_atac = X_atac.tocsr()
+
     adata.obsm["X_atac_peaks"] = X_atac
     adata.uns["atac_var_names"] = list(adata.var_names[atac_mask])
-
-    logger.info("  Multiome: ATAC peaks parked in obsm['X_atac_peaks']")
+    logger.info("  Multiome: ATAC peaks parked natively in obsm['X_atac_peaks']")
 
     from .utils import safe_in_memory_gene_subset
     adata = safe_in_memory_gene_subset(adata, keep_mask=rna_mask, logger=logger)
-    logger.info(f"  Multiome: RNA-only matrix retained")
     return adata
 
 
