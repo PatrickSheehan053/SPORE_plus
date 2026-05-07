@@ -1,21 +1,26 @@
 """
 SPORE+ · src/phase08_hvg.py
 ──────────────────────────────
-Phase 8: Highly Variable Gene Selection
-Adapted from SPORE phase5_hvg.py.
-Config key: phase8_hvg (was phase5_hvg).
+Phase 8: Dimensionality Reduction (Highly Variable Genes)
 
-Critical memory-safety lessons from SPORE error log applied:
-  Error 017: seurat_v3 X**2 OOM — use 100k subsample for HVG calc
-  Error 018: HVG metadata destroyed when calc_adata deleted — save to .uns
-  Error 019: seurat_v3 uses 'variances_norm' not 'dispersions_norm'
-  Error 010: gene subsetting uses C-buffer row reconstructor
+Engineered for zero-leakage Foundation Model training. 
+Unlike standard single-cell pipelines that calculate HVGs globally, 
+SPORE+ strictly computes variance metrics on the TRAINING split only, 
+and projects that feature mask onto the Validation and Test splits.
 
-Ghost Rescue (Error 033 re-applied at Phase 8):
-  Phase 6 rescued cell cycle genes from the sparsity cut.
-  But the adaptive UMI filter in Phase 6 may have already wiped them
-  before Phase 8 can include them in the HVG set.
-  We re-check and re-ghost them here if they were somehow dropped.
+Stratified Subsampling & Memory Safety
+──────────────────────────────────────
+The `seurat_v3` variance flavor natively requires dense matrix math. To 
+prevent OOM crashes on 1M+ cell datasets, the calculation is performed 
+on a 100k-cell subsample. To ensure rare perturbations aren't erased 
+by random chance, this subsample is strictly proportionally stratified 
+across all guide RNA groups.
+
+Rescue Operations
+─────────────────
+Perturbation targets and cell cycle genes (Ghosts) are forcibly injected 
+into the final HVG set if they were missed by the variance calculation, 
+ensuring they remain available for downstream regression and MSE loss evaluation.
 """
 
 import numpy as np
@@ -87,13 +92,32 @@ def select_hvgs(adata, cfg: dict, logger, split_label: str = "train"):
                 sampled_indices.extend(idx)
 
             idx = np.array(sampled_indices)
-            rng.shuffle(idx) # Shuffle to remove order bias
+            # THE FIX: Removed rng.shuffle(idx). Variance is permutation invariant.
+            # HDF5 strictly requires sorted index arrays to prevent I/O crashes.
         else:
             logger.warning("  Perturbation col not found. Falling back to random sample.")
             rng = np.random.default_rng(42)
             idx = rng.choice(adata.n_obs, size=n_sample, replace=False)
 
-        calc_X  = adata.X[idx, :]
+        # ── OOM FIREWALL: Safe Subsample Extraction ──
+        idx_sorted = np.sort(idx)
+        is_large = getattr(adata, 'isbacked', False) or adata.n_obs > 1000000
+
+        if is_large:
+            logger.info("  [HVG] Large/Backed mode: Extracting stratified subsample in safe micro-chunks...")
+            chunks = []
+            chunk_size = 10000
+            for i in range(0, len(idx_sorted), chunk_size):
+                sub_idx = idx_sorted[i:i+chunk_size]
+                # HDF5 handles sorted index arrays sequentially, avoiding buffer bloat
+                c = adata.X[sub_idx]
+                if not sp.issparse(c):
+                    c = sp.csr_matrix(c)
+                chunks.append(c)
+            calc_X = sp.vstack(chunks)
+        else:
+            calc_X = adata.X[idx_sorted, :]
+            
         import anndata as ad
         calc_adata = ad.AnnData(X=calc_X, var=adata.var.copy())
     else:
@@ -108,25 +132,23 @@ def select_hvgs(adata, cfg: dict, logger, split_label: str = "train"):
         calc_adata, flavor=method,
         n_top_genes=n_top, subset=False)
 
-    # ── Save HVG stats to .uns BEFORE deleting calc_adata ──
+    # ── Extract stats and immediately flush calc_adata to save RAM ──
     stat_cols = [c for c in calc_adata.var.columns
                  if c in ("highly_variable", "means",
                           "dispersions", "dispersions_norm",
                           "variances", "variances_norm")]
     hvg_stats = calc_adata.var[stat_cols].copy()
-    adata.uns["hvg_stats"] = hvg_stats.to_dict("index")
-    logger.info(f"  HVG stats saved to .uns['hvg_stats']")
-
     hvg_names = set(calc_adata.var_names[calc_adata.var["highly_variable"]])
+    rank_col = "variances_norm" if "variances_norm" in hvg_stats.columns else "dispersions_norm"
+    
     del calc_adata
     force_gc(logger)
 
-    # ── Phase 8 Ghost Rescue ───────────────────────────────────────────────
-    ghosts = [g for g in cc_in_matrix if g not in hvg_names]
-    if ghosts:
-        logger.info(f"  👻 HVG Ghost Rescue: {len(ghosts)} cell cycle genes added")
-        hvg_names.update(ghosts)
+    # Initialize tracking columns for diagnostics
+    hvg_stats["rescued_target"] = False
+    hvg_stats["rescued_ghost"] = False
 
+    # ── 1. Target Rescue: The 1-to-1 Swap ──────────────────────────────────
     if p8.get("rescue_perturbation_targets", True):
         pert_col   = cfg["dataset"]["perturbation_col"]
         ctrl_label = cfg["dataset"]["control_label"]
@@ -145,19 +167,65 @@ def select_hvgs(adata, cfg: dict, logger, split_label: str = "train"):
 
         target_rescue = (targets & var_set) - hvg_names
         if target_rescue:
-            logger.info(f"  ⚡ HVG Target Rescue: {len(target_rescue)} perturbation targets forced in")
-            hvg_names.update(target_rescue)
+            n_rescue = len(target_rescue)
+            logger.info(f"  ⚡ Target Rescue: {n_rescue} perturbation targets missing.")
 
-    # ── Apply HVG mask via C-buffer reconstructor ───
+            # Identify "pure" HVGs that are safe to drop (exclude targets/ghosts)
+            safe_to_drop = list(hvg_names - targets - set(cc_in_matrix))
+
+            if rank_col in hvg_stats.columns and len(safe_to_drop) >= n_rescue:
+                # Find the lowest variance genes
+                safe_scores = hvg_stats.loc[safe_to_drop, rank_col].sort_values(ascending=True)
+                genes_to_drop = safe_scores.head(n_rescue).index.tolist()
+
+                # Execute the Swap
+                hvg_names.difference_update(genes_to_drop)
+                hvg_names.update(target_rescue)
+
+                # Update the stats DataFrame to reflect the swap
+                hvg_stats.loc[genes_to_drop, "highly_variable"] = False
+                hvg_stats.loc[list(target_rescue), "highly_variable"] = True
+                hvg_stats.loc[list(target_rescue), "rescued_target"] = True
+
+                logger.info(f"  ⚡ Swapped bottom {len(genes_to_drop)} HVGs to backfill targets (Core stabilized at {n_top:,}).")
+            else:
+                logger.warning("  ⚡ Could not execute 1-to-1 swap. Adding targets on top.")
+                hvg_names.update(target_rescue)
+                hvg_stats.loc[list(target_rescue), "rescued_target"] = True
+
+    # ── 2. Ghost Rescue: The Stack ─────────────────────────────────────────
+    ghosts = [g for g in cc_in_matrix if g not in hvg_names]
+    if ghosts:
+        logger.info(f"  👻 Ghost Rescue: {len(ghosts)} cell cycle genes stacked on top.")
+        hvg_names.update(ghosts)
+        hvg_stats.loc[ghosts, "rescued_ghost"] = True
+
+    # ── OOM FIREWALL: Safely handle .uns mutation & subsetting ──
+    is_large = getattr(adata, 'isbacked', False) or adata.n_obs > 1000000
+    
     keep_mask = np.array([g in hvg_names for g in adata.var_names])
     n_kept    = keep_mask.sum()
     logger.info(f"  Subsetting from {adata.n_vars:,} → {n_kept:,} features")
+    
+    core_features = [g for g in adata.var_names if g in hvg_names and g not in set(ghosts)]
 
-    adata.uns["spore_core_features"] = [
-        g for g in adata.var_names if g in hvg_names and g not in set(ghosts)]
-
-    adata_new = safe_in_memory_gene_subset(adata, keep_mask=keep_mask, logger=logger)
-    del adata
+    if is_large:
+        logger.info("  [HVG] Large/Backed mode: Bypassing .uns HDF5 mutation to prevent kernel segfault...")
+        adata_new = adata[:, keep_mask]
+        
+        # AnnData views lock the .uns dict to prevent HDF5 corruption. 
+        # We override it with a brand new independent Python dictionary in memory.
+        adata_new.uns = adata.uns.copy() if hasattr(adata, 'uns') else {}
+        adata_new.uns["hvg_stats"] = hvg_stats.to_dict("index")
+        adata_new.uns["spore_core_features"] = core_features
+        logger.info(f"  HVG stats safely saved to in-memory .uns dictionary.")
+    else:
+        adata.uns["hvg_stats"] = hvg_stats.to_dict("index")
+        adata.uns["spore_core_features"] = core_features
+        logger.info(f"  HVG stats saved to .uns['hvg_stats']")
+        adata_new = safe_in_memory_gene_subset(adata, keep_mask=keep_mask, logger=logger)
+        del adata
+        
     force_gc(logger)
 
     snapshot(adata_new, "Post HVG selection", logger)
@@ -181,8 +249,15 @@ def apply_hvg_to_other_splits(splits: dict, hvg_names: list,
             continue
         split_adata = splits[key]
         keep_mask   = np.array([g in hvg_set for g in split_adata.var_names])
-        splits[key] = safe_in_memory_gene_subset(
-            split_adata, keep_mask=keep_mask, logger=logger)
+        
+        # ── OOM FIREWALL: Apply via lazy views for backed objects ──
+        is_large = getattr(split_adata, 'isbacked', False) or split_adata.n_obs > 1000000
+        if is_large:
+            splits[key] = split_adata[:, keep_mask]
+        else:
+            splits[key] = safe_in_memory_gene_subset(
+                split_adata, keep_mask=keep_mask, logger=logger)
+            
         snapshot(splits[key], f"HVG applied to {key}", logger)
         force_gc(logger)
     return splits
@@ -198,85 +273,3 @@ def run_phase8(splits: dict, cfg: dict, logger):
     splits["train"] = train_new
     splits = apply_hvg_to_other_splits(splits, hvg_names, cfg, logger)
     return splits, hvg_names
-
-def print_hvg_diagnostics(adata):
-    """
-    Prints a clean Pandas DataFrame summary of the HVG selection, ghost rescues,
-    and distribution metrics for each gene category.
-    """
-    import pandas as pd
-
-    if "hvg_stats" not in adata.uns:
-        print("No HVG stats found. Run Phase 8 first.")
-        return
-
-    hvg_df = pd.DataFrame.from_dict(adata.uns["hvg_stats"], orient="index")
-    
-    # 1. Feature Counts
-    total_pre_genes = len(hvg_df)
-    hvg_genes = hvg_df["highly_variable"].sum()
-    non_hvg = total_pre_genes - hvg_genes
-    final_features = len(adata.var_names)
-    rescued_count = final_features - hvg_genes
-
-    df_counts = pd.DataFrame({
-        "Metric": [
-            "Starting Features (Phase 6)",
-            "Non-Variable (Filtered)",
-            "Highly Variable (Retained)",
-            "Total Rescues (Targets + Cell Cycle)",
-            "Final Feature Space"
-        ],
-        "Count": [
-            f"{total_pre_genes:,}", f"{non_hvg:,}", f"{hvg_genes:,}", 
-            f"{rescued_count:,}", f"{final_features:,}"
-        ],
-        "Percentage": [
-            "100.0%", f"{(non_hvg/total_pre_genes)*100:.1f}%", f"{(hvg_genes/total_pre_genes)*100:.1f}%",
-            f"{(rescued_count/total_pre_genes)*100:.2f}%", f"{(final_features/total_pre_genes)*100:.1f}%"
-        ]
-    })
-
-    print("\n" + "="*70)
-    print(" SPORE+ HVG SELECTION DIAGNOSTICS")
-    print("="*70)
-    print(df_counts.to_string(index=False))
-    
-    # 2. Distribution Metrics
-    # Determine which variance column was used
-    y_col, y_name = None, None
-    if "variances_norm" in hvg_df.columns:
-        y_col, y_name = "variances_norm", "Variance"
-    elif "dispersions_norm" in hvg_df.columns:
-        y_col, y_name = "dispersions_norm", "Dispersion"
-
-    if y_col:
-        hvg_df["Status"] = "Non-Variable"
-        hvg_df.loc[hvg_df["highly_variable"], "Status"] = "Highly Variable"
-        
-        if "spore_core_features" in adata.uns:
-            core = set(adata.uns["spore_core_features"])
-            ghosts = [g for g in adata.var_names if g not in core and g in hvg_df.index]
-            if ghosts:
-                hvg_df.loc[ghosts, "Status"] = "Rescued Targets"
-        
-        dist_data = []
-        for status in ["Non-Variable", "Highly Variable", "Rescued Targets"]:
-            sub = hvg_df[hvg_df["Status"] == status]
-            if len(sub) == 0: continue
-            
-            dist_data.append({
-                "Category": status,
-                "Mean Expr (Avg)": f"{sub['means'].mean():.3f}",
-                "Mean Expr (Range)": f"[{sub['means'].min():.3f}, {sub['means'].max():.2f}]",
-                f"Norm. {y_name} (Avg)": f"{sub[y_col].mean():.3f}",
-                f"Norm. {y_name} (Range)": f"[{sub[y_col].min():.3f}, {sub[y_col].max():.2f}]"
-            })
-            
-        if dist_data:
-            print("-" * 70)
-            print(" DISTRIBUTION METRICS")
-            print("-" * 70)
-            print(pd.DataFrame(dist_data).to_string(index=False))
-
-    print("="*70 + "\n")
