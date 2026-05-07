@@ -3,34 +3,27 @@ SPORE+ · src/phase03_ambient.py
 ────────────────────────────────
 Milestone 2 · Ambient RNA Detection
 
-For CRISPR-screen datasets (which are the primary target of SPORE+), two
-situations arise:
+Designed to scale efficiently to 2M+ cell datasets (e.g., Replogle K562).
+For CRISPR-screen datasets, two situations arise:
 
-  A. Raw (unfiltered) 10x matrix is available alongside the filtered h5ad.
-     In this case we can run a SoupX-style ambient correction that removes the
-     background signal estimated from empty droplets.
+  A. Raw Matrix Mode: Unfiltered 10x matrix is available. Runs a SoupX-style 
+     ambient correction that estimates the background profile from empty droplets.
+     
+  B. Global Profile Mode: Only the filtered h5ad is available. Computes a 
+     data-driven "ambient signature" as the mean expression profile across 
+     the entire dataset.
 
-  B. Only the filtered h5ad is available (the common case for published data).
-     We cannot estimate the ambient profile from empty droplets, so we take a
-     data-driven approach:
-       1. Compute the "ambient signature" as the mean expression profile across
-          all non-targeting control cells (they should express background at
-          the highest level, since no gene is targeted).
-       2. For each cell, compute the cosine similarity between its expression
-          profile and the ambient signature.
-       3. Flag cells where the ambient cosine > threshold AND their total UMI
-          count is in the bottom decile (depleted CRISPRi + high ambient =
-          probable contaminated / dying cell).
+Scoring & Safety Mechanism
+──────────────────────────
+For each cell, we compute the cosine similarity between its expression profile 
+and the ambient signature. 
 
-We never remove cells in Phase 3 by default — we only add a flag column
-`ambient_score` and optionally `ambient_flagged`. Removal requires the user
-to set `phase3_ambient.remove_flagged: true` in the yaml.
+CRITICAL: Cells are only flagged if they have an ambient cosine > threshold 
+AND their total UMI count is in the bottom percentile (e.g., bottom 10%). 
+(High ambient signal + Low UMI = dying cell / empty droplet).
 
-This design keeps SPORE+ non-destructive in ambient detection and lets the
-user inspect the flags before committing.
-
-Memory budget: O(n_genes) for the ambient profile + O(n_cells) for scoring.
-No large matrix copies. Safe for 1.5M-cell datasets.
+This phase is non-destructive by default. It adds `ambient_score` and 
+`ambient_flagged` to .obs. Removal requires `remove_flagged: true` in the config.
 """
 
 from __future__ import annotations
@@ -84,8 +77,6 @@ def run_phase3(adata, cfg: dict, logger) -> "AnnData":
     threshold     = float(phase_cfg.get("flag_threshold", 0.80))
     remove        = bool(phase_cfg.get("remove_flagged", False))
     min_umi_pct   = float(phase_cfg.get("min_umi_pct", 0.10))
-    pert_col      = cfg["dataset"]["perturbation_col"]
-    ctrl_label    = cfg["dataset"]["control_label"]
 
     n_start = adata.n_obs
 
@@ -98,6 +89,9 @@ def run_phase3(adata, cfg: dict, logger) -> "AnnData":
         else:
             adata = _ambient_from_raw_matrix(adata, raw_path, threshold,
                                               min_umi_pct, log)
+            # If raw_matrix failed internally, it won't write 'ambient_score'. Force fallback.
+            if "ambient_score" not in adata.obs:
+                mode = "control_profile"
 
     if mode in ["control_profile", "global_profile"]:
         adata = _ambient_from_global_profile(
@@ -130,14 +124,43 @@ def _ambient_from_global_profile(adata, threshold: float, min_umi_pct: float, lo
     """
     logger.info(f"  Computing ambient signature from global dataset average ({adata.n_obs:,} cells)...")
 
-    X = adata.X
-    if sp.issparse(X):
-        ambient_profile = np.asarray(X.mean(axis=0)).ravel()
+    n_cells = adata.n_obs
+    n_genes = adata.n_vars
+    
+    # ── OOM FIREWALL: Chunked Mean Calculation ──
+    # Threshold set to 1,000,000 cells
+    is_large = getattr(adata, 'isbacked', False) or n_cells > 1000000
+    
+    if is_large:
+        logger.info("  Large dataset detected. Chunking global profile calculation to prevent OOM...")
+        global_sum = np.zeros(n_genes, dtype=np.float64)
+        chunk_size = 50000
+        
+        for start in range(0, n_cells, chunk_size):
+            end = min(start + chunk_size, n_cells)
+            chunk = adata.X[start:end]
+            
+            if sp.issparse(chunk):
+                global_sum += np.asarray(chunk.sum(axis=0)).flatten()
+            else:
+                global_sum += np.asarray(chunk.sum(axis=0)).flatten()
+                
+            del chunk # Immediately free chunk RAM
+        
+        ambient_profile = (global_sum / n_cells).astype(np.float32)
+        del global_sum
+        
     else:
-        ambient_profile = X.mean(axis=0).ravel()
+        # Fast path for small, fully-in-memory datasets
+        X = adata.X
+        if sp.issparse(X):
+            ambient_profile = np.asarray(X.mean(axis=0)).ravel()
+        else:
+            ambient_profile = X.mean(axis=0).ravel()
 
     ambient_profile = ambient_profile.astype(np.float32)
     amb_norm = np.linalg.norm(ambient_profile)
+    
     if amb_norm < 1e-10:
         logger.warning("  Phase 3: ambient profile is near-zero — scoring skipped")
         adata.obs["ambient_score"]   = 0.0
@@ -148,8 +171,10 @@ def _ambient_from_global_profile(adata, threshold: float, min_umi_pct: float, lo
 
     # Score in batches to avoid memory blowouts on massive datasets
     batch_size = 50_000
-    n_cells    = adata.n_obs
     scores     = np.zeros(n_cells, dtype=np.float32)
+    
+    # ── THE FIX: Define X here so the scoring loop can safely access it ──
+    X = adata.X
 
     for start in range(0, n_cells, batch_size):
         end   = min(start + batch_size, n_cells)
@@ -265,7 +290,16 @@ def _ambient_from_raw_matrix(adata, raw_h5_path: str, threshold: float,
             scores[start:end] = (batch / norms) @ amb_unit
 
         adata.obs["ambient_score"]   = scores.tolist()
-        adata.obs["ambient_flagged"] = (scores > threshold).tolist()
+        
+        if "total_counts" in adata.obs.columns:
+            umi_vals     = adata.obs["total_counts"].values.astype(float)
+            umi_thresh   = float(np.percentile(umi_vals, min_umi_pct * 100))
+            low_umi_mask = umi_vals <= umi_thresh
+        else:
+            low_umi_mask = np.ones(n_cells, dtype=bool)
+
+        adata.obs["ambient_flagged"] = ((scores > threshold) & low_umi_mask).tolist()
+        
         del raw, raw_sub, X_empty
         gc.collect()
         return adata
