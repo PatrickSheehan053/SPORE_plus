@@ -1,26 +1,29 @@
 """
 SPORE+ · src/phase05_escaper_filtering.py
 ──────────────────────────────────────────
-Phase 5: Escaper Filtering + Knockdown Efficiency Scoring (Milestone 2)
+Phase 5: Escaper Filtering & Knockdown Efficiency Scoring
 
-MILESTONE 2 UPGRADE — Efficiency Scoring:
-  After the escaper filter, for each perturbation group compute:
-    efficiency_score        : fraction of cells that passed the filter
-    mean_knockdown_depth    : mean target expression in kept cells / mean in controls
-                              (lower = better knockdown, 0 = perfect, 1 = no effect)
-    low_efficiency_flag     : True if efficiency_score < efficiency_threshold
+Engineered for 2M+ cell scCRISPR-seq datasets (e.g., Replogle 2022). 
+In CRISPR screens, "escapers" are cells that received a guide but did not 
+experience the intended biological perturbation. This phase filters them out 
+by comparing target gene expression against the non-targeting control distribution.
 
-  These are stored in adata.uns["knockdown_efficiency"] and added as per-cell
-  obs columns: 'escaper_efficiency', 'escaper_knockdown_depth'.
+Sparse Memory Architecture
+──────────────────────────
+To prevent OOM crashes on massive matrices, control cells are temporarily 
+cached into a CSC (Compressed Sparse Column) matrix. This allows O(1) column 
+lookups for target genes. Expression arrays are flattened to 1D dense vectors 
+one gene at a time, keeping the memory overhead functionally zero.
 
-  This gives a per-pertforurbation quality readout that CHITIN can weight downstream.
+Biological Directionality
+─────────────────────────
+  • CRISPRi / Knockout: Retains cells ≤ Nth percentile of controls.
+  • CRISPRa / Activation: Retains cells ≥ (100-N)th percentile of controls.
+    (Includes a 1e-5 zero-inflation safeguard for highly sparse genes).
 
-CRISPRa DIRECTION FIX (Milestone 1):
-  For knockdown (CRISPRi/ko): keep cells ≤ Nth percentile of controls
-  For activation (CRISPRa): keep cells ≥ (100-N)th percentile of controls
-
-COMBINATORIAL FIX (Milestone 1):
-  "GENE_A+GENE_B" labels are parsed to constituent genes for threshold comparison.
+Combinatorial multiplexing (e.g., "GENE_A+GENE_B") is natively supported.
+Efficiency metrics are logged to `adata.uns["knockdown_efficiency"]` and 
+added as per-cell observations.
 """
 
 import numpy as np
@@ -70,10 +73,37 @@ def filter_escapers(adata, cfg: dict, logger):
     perturbations = [p for p in np.unique(pert_values) if p != ctrl_label]
     logger.info(f"  Perturbation targets: {len(perturbations):,}")
 
-    gene_to_idx = {g: i for i, g in enumerate(adata.var_names)}
+    # ── ALIAS MAPPING FIX: Map var_names AND all var metadata (e.g., old Ensembl IDs) ──
+    gene_to_idx = {}
+    
+    # 1. Map the active column names (Gene Symbols)
+    for i, g in enumerate(adata.var_names):
+        gene_to_idx[str(g)] = i
+        
+    # 2. Scan the metadata columns for the original Ensembl IDs and map them to the same index
+    for col in adata.var.columns:
+        for i, val in enumerate(adata.var[col]):
+            if pd.notna(val):
+                gene_to_idx[str(val)] = i
 
-    # Pre-cache control cells in CSC for efficient column slicing (Error 003 fix)
-    ctrl_X_csc = adata.X[ctrl_indices, :].tocsc()
+    # ── OOM FIREWALL 1: Micro-Chunked Control Caching ──
+    is_large = getattr(adata, 'isbacked', False) or adata.n_obs > 1000000
+    
+    if is_large:
+        logger.info("  [Escaper] Large/Backed mode: caching control cells in micro-chunks for safe I/O...")
+        ctrl_chunks = []
+        chunk_size = 50000
+        for i in range(0, len(ctrl_indices), chunk_size):
+            idx_chunk = ctrl_indices[i:i+chunk_size]
+            c = adata.X[idx_chunk]
+            if not sp.issparse(c):
+                c = sp.csr_matrix(c)
+            ctrl_chunks.append(c)
+        ctrl_X_csc = sp.vstack(ctrl_chunks).tocsc()
+        del ctrl_chunks
+    else:
+        ctrl_X_csc = adata.X[ctrl_indices, :].tocsc()
+        
     log_memory(logger, "after control CSC cache")
 
     cells_to_keep   = list(ctrl_indices)
@@ -102,14 +132,33 @@ def filter_escapers(adata, cfg: dict, logger):
         pass_mask = np.ones(len(pert_indices), dtype=bool)
         knockdown_depths = []
 
+        # ── OOM FIREWALL 2: Safe Perturbation Block Extraction ──
+        if is_large:
+            pert_chunks = []
+            chunk_size = 50000
+            for i in range(0, len(pert_indices), chunk_size):
+                idx_chunk = pert_indices[i:i+chunk_size]
+                c = adata.X[idx_chunk]
+                if not sp.issparse(c):
+                    c = sp.csr_matrix(c)
+                pert_chunks.append(c)
+            pert_X_csc = sp.vstack(pert_chunks).tocsc()
+            del pert_chunks
+        else:
+            pert_X_csc = adata.X[pert_indices, :]
+            if not sp.issparse(pert_X_csc):
+                pert_X_csc = sp.csr_matrix(pert_X_csc)
+            pert_X_csc = pert_X_csc.tocsc()
+
+        pass_mask = np.ones(len(pert_indices), dtype=bool)
+        knockdown_depths = []
+
         for gene in genes_in_mat:
             gene_idx  = gene_to_idx[gene]
             ctrl_expr = ctrl_X_csc[:, gene_idx].toarray().flatten()
-            pert_expr = adata.X[pert_indices, :][:, gene_idx]
-            if sp.issparse(pert_expr):
-                pert_expr = pert_expr.toarray().flatten()
-            else:
-                pert_expr = np.asarray(pert_expr).flatten()
+            
+            # Instantly slice the column from the RAM-cached CSC matrix
+            pert_expr = pert_X_csc[:, gene_idx].toarray().flatten()
 
             # ── FIX 1: Calculate TRUE Knockdown Depth on ALL cells (No Survivor Bias) ──
             ctrl_mean = ctrl_expr.mean()
@@ -147,7 +196,7 @@ def filter_escapers(adata, cfg: dict, logger):
             "knockdown_depth":   kd_depth,
             "low_efficiency":    efficiency < eff_thresh}
 
-        del ctrl_expr, pert_expr, pass_mask
+        del ctrl_expr, pert_expr, pass_mask, pert_X_csc
 
     del ctrl_X_csc
     gc.collect()
