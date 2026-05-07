@@ -45,15 +45,39 @@ def filter_genes(adata, cfg: dict, logger):
     X = adata.X
     log_memory(logger, "Before feature metric calculation")
 
-    # CRITICAL (Error 008): never use (X > 0) — allocates full boolean matrix
-    # Use .getnnz(axis=0) to get non-zero counts directly from CSR structure
-    if sp.issparse(X):
-        cells_per_gene = X.getnnz(axis=0)
-        # CRITICAL (Error 009): never use .mean() — use .sum() / n_obs
-        mean_expr = np.array(X.sum(axis=0)).flatten() / adata.n_obs
+    # ── OOM FIREWALL: Chunked Metric Calculation ──
+    n_cells = adata.n_obs
+    n_genes = adata.n_vars
+    is_large = getattr(adata, 'isbacked', False) or n_cells > 1000000
+
+    if is_large:
+        logger.info("  [Gene Triage] Large/Backed mode: computing gene metrics in safe chunks...")
+        cells_per_gene = np.zeros(n_genes, dtype=np.int64)
+        sum_expr = np.zeros(n_genes, dtype=np.float64)
+        chunk_size = 50000
+        
+        for start in range(0, n_cells, chunk_size):
+            end = min(start + chunk_size, n_cells)
+            chunk = X[start:end]
+            
+            if sp.issparse(chunk):
+                cells_per_gene += chunk.getnnz(axis=0)
+                sum_expr += np.asarray(chunk.sum(axis=0)).flatten()
+            else:
+                cells_per_gene += (chunk > 0).sum(axis=0)
+                sum_expr += np.asarray(chunk.sum(axis=0)).flatten()
+            del chunk # Free memory instantly
+            
+        mean_expr = (sum_expr / n_cells).astype(np.float32)
+        del sum_expr
     else:
-        cells_per_gene = (X > 0).sum(axis=0)
-        mean_expr      = X.mean(axis=0)
+        # Fast path for small, fully in-memory datasets
+        if sp.issparse(X):
+            cells_per_gene = X.getnnz(axis=0)
+            mean_expr = np.array(X.sum(axis=0)).flatten() / n_cells
+        else:
+            cells_per_gene = (X > 0).sum(axis=0)
+            mean_expr      = X.mean(axis=0)
 
     keep_genes = np.ones(adata.n_vars, dtype=bool)
 
@@ -134,11 +158,9 @@ def filter_genes(adata, cfg: dict, logger):
     adata_new = safe_in_memory_gene_subset(adata, keep_mask=final_keep, logger=logger)
 
     # ── THE FIX: Permanently attach the pre-filter stats to the metadata ──
-    # We calculate the original sparsity array here
-    if sp.issparse(X):
-        orig_pct_cells = (X.getnnz(axis=0) / adata.n_obs) * 100
-    else:
-        orig_pct_cells = ((X > 0).sum(axis=0) / adata.n_obs) * 100
+    # OOM FIREWALL: Re-use the safely chunked `cells_per_gene` array we already
+    # built at the top of the file instead of pulling the whole matrix again
+    orig_pct_cells = (cells_per_gene / adata.n_obs) * 100
         
     adata_new.uns["phase6_waterfall"] = dict(waterfall)
     adata_new.uns["phase6_gene_penetrance"] = np.float32(orig_pct_cells)
