@@ -54,6 +54,13 @@ def select_hvgs(adata, cfg: dict, logger, split_label: str = "train"):
 
     log_memory(logger, "Phase 8 start")
 
+    # ── THE H5PY SEGFAULT FIREWALL ──
+    # Matrix is ~8,000 genes. Pulling into RAM (~5GB) severs the h5py disk link.
+    if getattr(adata, 'isbacked', False):
+        logger.info(f"  [{split_label}] Pulling 8k-gene matrix into RAM to bypass h5py indexing crash...")
+        adata = adata.to_memory()
+        force_gc(logger)
+
     # ── Ghost re-rescue at Phase 8 ─────────────────────────────────────────
     cc_s, cc_g2m = get_cell_cycle_genes()
     cc_genes  = set(cc_s + cc_g2m)
@@ -200,63 +207,45 @@ def select_hvgs(adata, cfg: dict, logger, split_label: str = "train"):
         hvg_names.update(ghosts)
         hvg_stats.loc[ghosts, "rescued_ghost"] = True
 
-    # ── OOM FIREWALL: Safely handle .uns mutation & subsetting ──
-    is_large = getattr(adata, 'isbacked', False) or adata.n_obs > 1000000
-    
+    # RESTORED MISSING VARIABLES
     keep_mask = np.array([g in hvg_names for g in adata.var_names])
     n_kept    = keep_mask.sum()
     logger.info(f"  Subsetting from {adata.n_vars:,} → {n_kept:,} features")
     
     core_features = [g for g in adata.var_names if g in hvg_names and g not in set(ghosts)]
 
-    if is_large:
-        logger.info("  [HVG] Large/Backed mode: Bypassing .uns HDF5 mutation to prevent kernel segfault...")
-        adata_new = adata[:, keep_mask]
-        
-        # AnnData views lock the .uns dict to prevent HDF5 corruption. 
-        # We override it with a brand new independent Python dictionary in memory.
-        adata_new.uns = adata.uns.copy() if hasattr(adata, 'uns') else {}
-        adata_new.uns["hvg_stats"] = hvg_stats.to_dict("index")
-        adata_new.uns["spore_core_features"] = core_features
-        logger.info(f"  HVG stats safely saved to in-memory .uns dictionary.")
-    else:
-        adata.uns["hvg_stats"] = hvg_stats.to_dict("index")
-        adata.uns["spore_core_features"] = core_features
-        logger.info(f"  HVG stats saved to .uns['hvg_stats']")
-        adata_new = safe_in_memory_gene_subset(adata, keep_mask=keep_mask, logger=logger)
-        del adata
-        
+    # Since the matrix is safely in RAM, we bypass chunking and natively subset
+    adata_new = safe_in_memory_gene_subset(adata, keep_mask=keep_mask, logger=logger)
+    
+    if not hasattr(adata_new, "uns"): 
+        adata_new.uns = {}
+    adata_new.uns["hvg_stats"] = hvg_stats.to_dict("index")
+    adata_new.uns["spore_core_features"] = core_features
+
+    del adata
     force_gc(logger)
 
     snapshot(adata_new, "Post HVG selection", logger)
     log_memory(logger, "Phase 8 end")
     return adata_new, list(hvg_names)
 
-
-def apply_hvg_to_other_splits(splits: dict, hvg_names: list,
-                               cfg: dict, logger):
-    """
-    Apply the HVG mask determined from train to val and test splits.
-    CRITICAL: HVG must be computed on train ONLY to prevent data leakage.
-    The same gene set is then applied to val/test.
-    """
-    logger.info(f"  Applying HVG mask to val/test splits "
-                f"({len(hvg_names):,} features)...")
+def apply_hvg_to_other_splits(splits: dict, hvg_names: list, cfg: dict, logger):
+    logger.info(f"  Applying HVG mask to val/test splits ({len(hvg_names):,} features)...")
     hvg_set = set(hvg_names)
 
     for key in ["val", "test"]:
         if key not in splits:
             continue
         split_adata = splits[key]
-        keep_mask   = np.array([g in hvg_set for g in split_adata.var_names])
         
-        # ── OOM FIREWALL: Apply via lazy views for backed objects ──
-        is_large = getattr(split_adata, 'isbacked', False) or split_adata.n_obs > 1000000
-        if is_large:
-            splits[key] = split_adata[:, keep_mask]
-        else:
-            splits[key] = safe_in_memory_gene_subset(
-                split_adata, keep_mask=keep_mask, logger=logger)
+        # Pull Val/Test off the disk and into RAM before slicing
+        if getattr(split_adata, 'isbacked', False):
+            logger.info(f"  [{key}] Pulling backed matrix into RAM to bypass h5py crash...")
+            split_adata = split_adata.to_memory()
+            force_gc(logger)
+
+        keep_mask = np.array([g in hvg_set for g in split_adata.var_names])
+        splits[key] = safe_in_memory_gene_subset(split_adata, keep_mask=keep_mask, logger=logger)
             
         snapshot(splits[key], f"HVG applied to {key}", logger)
         force_gc(logger)
@@ -264,10 +253,6 @@ def apply_hvg_to_other_splits(splits: dict, hvg_names: list,
 
 
 def run_phase8(splits: dict, cfg: dict, logger):
-    """
-    Full Phase 8: compute HVG on train, apply to val/test.
-    Returns updated splits dict.
-    """
     train_new, hvg_names = select_hvgs(
         splits["train"], cfg, logger, split_label="train")
     splits["train"] = train_new
