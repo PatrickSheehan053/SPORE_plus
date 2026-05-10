@@ -1,20 +1,21 @@
 """
 SPORE+ · src/phase10_confounders.py
 ──────────────────────────────────────
-Phase 10: Confounder Mitigation
+Phase 10: Confounder Mitigation & Batch Correction
 
-All computational logic lives here. phase10_worker.py is a thin CLI shim
-that calls run_worker_logic() so there is zero code duplication.
+Executes dimensionality reduction and batch correction in an isolated memory 
+environment. 
 
-Architecture:
-  - force_heap_return()       — parent-side cleanup before subprocess launch
-  - safe_scale_inplace()      — chunked per-gene std scaling, no matrix copy
-  - subsample_pca()           — fit on 100k cells, project all via sparse @ dense
-  - run_harmony()             — harmonypy direct call, shape-safe
-  - run_worker_logic()        — full Phase 10 computation (called by worker CLI)
-  - run_phase10_subprocess()  — launches phase10_worker.py as a fresh process
-  - load_phase10_results()    — reloads the 300 MB .npz into parent
-  - run_phase10()             — public notebook entry point
+Architectural Highlights
+────────────────────────
+1. Subsample PCA: Fits TruncatedSVD on a representative 100k-cell subset, 
+   then projects the full 1M+ cell sparse matrix into the stable subspace.
+2. Harmony Integration (Korsunsky et al., 2019): Iterative clustering and 
+   correction applied directly to the PCA embeddings to mitigate batch effects 
+   (e.g., separate sequencing lanes or cell lines).
+3. Ghost Excision: Automatically strips out temporary Cell Cycle "Ghost" genes 
+   after the embeddings are generated, returning the dataset to its strict 
+   5,000-feature core envelope for downstream foundation model training.
 """
 
 import gc
@@ -550,6 +551,165 @@ def load_phase10_results(output_paths, logger):
         f"obs={obs_shape}. Parent RSS={parent_rss:.1f} GB")
     return adata_p10
 
+def strip_ghost_genes(splits_dir, dataset_name, logger):
+    """
+    Loads the P9 matrices from disk, reads the 'spore_core_features' from .uns,
+    slices out the temporary Ghost genes, and saves the strict 5,000-feature matrices as P10.
+    """
+    import anndata as ad
+    import numpy as np
+    import gc
+    from pathlib import Path
+    
+    logger.info("  Step 4: Executing Ghost Excision (returning to Core Feature envelope)...")
+    
+    # ── Load Train First to extract the Core Feature list ──
+    train_p9_path = Path(splits_dir) / f"{dataset_name}_train_p9.h5ad"
+    if not train_p9_path.exists():
+        logger.warning("  WARNING: train_p9.h5ad not found. Ghost excision skipped.")
+        return
+        
+    logger.info("    Slicing train split...")
+    tmp_ad = ad.read_h5ad(train_p9_path)
+    
+    if "spore_core_features" not in tmp_ad.uns:
+        logger.warning("  WARNING: 'spore_core_features' not found in train_p9.uns. Ghost excision skipped.")
+        del tmp_ad
+        return
+        
+    core_set = set(tmp_ad.uns["spore_core_features"])
+    keep_mask = np.array([g in core_set for g in tmp_ad.var_names])
+    n_dropped = len(keep_mask) - keep_mask.sum()
+    
+    if n_dropped > 0:
+        tmp_ad = tmp_ad[:, keep_mask].copy()
+        logger.info(f"      Dropped {n_dropped} Ghost genes. Final shape: {tmp_ad.shape}")
+    else:
+        logger.info(f"      No Ghost genes found. Shape remains: {tmp_ad.shape}")
+        
+    tmp_ad.write_h5ad(Path(splits_dir) / f"{dataset_name}_train_p10.h5ad")
+    del tmp_ad
+    for _ in range(3): gc.collect()
+    
+    # ── Now process Val and Test splits ──
+    for key in ["val", "test"]:
+        p9_path = Path(splits_dir) / f"{dataset_name}_{key}_p9.h5ad"
+        p10_path = Path(splits_dir) / f"{dataset_name}_{key}_p10.h5ad"
+        
+        if not p9_path.exists():
+            continue
+            
+        logger.info(f"    Slicing {key} split...")
+        tmp_ad = ad.read_h5ad(p9_path)
+        keep_mask = np.array([g in core_set for g in tmp_ad.var_names])
+        n_dropped = len(keep_mask) - keep_mask.sum()
+        
+        if n_dropped > 0:
+            tmp_ad = tmp_ad[:, keep_mask].copy()
+            logger.info(f"      Dropped {n_dropped} Ghost genes. Final shape: {tmp_ad.shape}")
+        else:
+            logger.info(f"      No Ghost genes found. Shape remains: {tmp_ad.shape}")
+            
+        tmp_ad.write_h5ad(p10_path)
+        del tmp_ad
+        for _ in range(3): gc.collect()
+        
+    logger.info("  Ghost Excision complete. Dataset strict envelope restored.")
+
+def ghost_excision_streaming(cfg: dict, logger, chunk_rows: int = 50_000):
+    """
+    Remove stacked ghost (cell-cycle) genes from p9 splits by streaming.
+    Never loads a full split into the parent's RAM.
+    Peak RAM = parent overhead + one 50k-row chunk (~0.5 GB).
+    """
+    import anndata as ad
+    import ctypes
+    from ctypes.util import find_library
+
+    dataset_name = cfg["dataset"]["name"]
+    splits_dir   = cfg["paths"]["_splits"]
+
+    def malloc_trim_now():
+        try:
+            libc = ctypes.CDLL(find_library("c") or "libc.so.6")
+            libc.malloc_trim.argtypes = [ctypes.c_size_t]
+            libc.malloc_trim.restype  = ctypes.c_int
+            libc.malloc_trim(0)
+        except Exception:
+            pass
+
+    # Read the core feature list from the p8 train file (backed = 0 GB cost)
+    p8_path = splits_dir / f"{dataset_name}_train_p8.h5ad"
+    if not p8_path.exists():
+        logger.warning("  Ghost Excision: train_p8.h5ad not found — copying p9 → p10")
+        import shutil
+        for key in ["train", "val", "test"]:
+            src = splits_dir / f"{dataset_name}_{key}_p9.h5ad"
+            dst = splits_dir / f"{dataset_name}_{key}_p10.h5ad"
+            if src.exists():
+                shutil.copy2(src, dst)
+                logger.info(f"  [{key}] p9 → p10 (copy, no ghost removal)")
+        return
+
+    p8_backed     = ad.read_h5ad(p8_path, backed="r")
+    all_var_names = list(p8_backed.var_names)
+    core_features = p8_backed.uns.get("spore_core_features", None)
+    p8_backed.file.close()
+
+    if not core_features:
+        logger.warning("  Ghost Excision: spore_core_features missing — skipping")
+        return
+
+    core_set  = set(core_features)
+    keep_mask = np.array([g in core_set for g in all_var_names])
+    gene_idx  = np.where(keep_mask)[0]
+    n_ghost   = int((~keep_mask).sum())
+    n_kept    = int(keep_mask.sum())
+    logger.info(f"  Ghost Excision: removing {n_ghost} ghost gene(s), "
+                f"keeping {n_kept} core HVGs")
+
+    for key in ["train", "val", "test"]:
+        p9_path  = splits_dir / f"{dataset_name}_{key}_p9.h5ad"
+        p10_path = splits_dir / f"{dataset_name}_{key}_p10.h5ad"
+
+        if not p9_path.exists():
+            logger.warning(f"  [{key}] p9 file not found, skipping")
+            continue
+
+        rss = psutil.Process().memory_info().rss / 1e9
+        logger.info(f"  [{key}] Streaming ghost excision  (RAM before: {rss:.1f} GB)")
+
+        backed = ad.read_h5ad(p9_path, backed="r")
+        n_obs  = backed.n_obs
+
+        chunks = []
+        for start in range(0, n_obs, chunk_rows):
+            end   = min(start + chunk_rows, n_obs)
+            chunk = backed.X[start:end]
+            if sp.issparse(chunk):
+                chunk = chunk.tocsr()[:, gene_idx]
+            else:
+                chunk = sp.csr_matrix(chunk[:, gene_idx])
+            chunks.append(chunk.astype(np.float32))
+            del chunk
+
+        X_new     = sp.vstack(chunks, format="csr")
+        del chunks
+        gc.collect()
+
+        var_new   = backed.var.iloc[gene_idx].copy()
+        obs_new   = backed.obs.copy()
+        adata_out = ad.AnnData(X=X_new, obs=obs_new, var=var_new)
+        backed.file.close()
+
+        adata_out.write_h5ad(p10_path)
+        del adata_out, X_new
+        gc.collect()
+        malloc_trim_now()
+
+        rss = psutil.Process().memory_info().rss / 1e9
+        logger.info(f"  [{key}] {n_obs:,} × {n_kept:,} saved → {p10_path}  "
+                    f"(RAM after: {rss:.1f} GB)")
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  PUBLIC NOTEBOOK ENTRY POINT
@@ -590,6 +750,12 @@ def run_phase10(splits, cfg, logger):
 
     logger.info("  Step 3: loading lightweight results into parent...")
     adata_p10 = load_phase10_results(output_paths, logger)
+    
+    # Ghost Excision: strip temporary cell-cycle genes via streaming disk reads.
+    # ghost_excision_streaming reads each p9 split in 50k-row chunks so the
+    # parent never loads a full 1.45M-cell matrix into RAM.
+    ghost_excision_streaming(cfg, logger)
+    
     log_memory(logger, "Phase 10 complete")
 
     return {"train": adata_p10, "_output_paths": output_paths}
